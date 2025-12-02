@@ -221,6 +221,11 @@ bash run_eval.sh
 python3 scripts/download_hf_data.py --repo_id fredzzp/fine_code --local_dir ./data
 ```
 
+If you run into errors, try running with smaller number of max_workers (default is 100)
+```
+python3 scripts/download_hf_data.py --repo_id fredzzp/fine_code --local_dir ./data --max_workers 10
+```
+
 ### Training
 
 ```bash
