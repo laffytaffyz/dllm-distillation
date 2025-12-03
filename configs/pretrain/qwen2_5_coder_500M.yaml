@@ -16,7 +16,7 @@ data:
 
 train:
   output_dir: logs/Qwen2.5-Coder-0.5B_mdm
-  repr_align_wt: 0.0  # Weight for representation alignment loss (0 = disabled)
+  # repr_align_wt: 0.0  # Weight for representation alignment loss (0 = disabled)
   data_parallel_mode: ddp
   ulysses_parallel_size: 1
   global_batch_size: 512
