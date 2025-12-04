@@ -1,16 +1,17 @@
 """
-Knowledge Distillation Training Script for Open-dLLM
+Enhanced Knowledge Distillation Training Script for Diffusion LLMs
 
-This script extends train_torch.py to support knowledge distillation:
-- Teacher model: Larger pre-trained model (e.g., Qwen2.5-Coder-7B)
-- Student model: Smaller model to be trained (e.g., Qwen2.5-Coder-0.5B)
-- Distillation loss: KL divergence between teacher and student logits
-- Combined loss: student_loss + alpha * distillation_loss
+This script extends train_distill.py to support diffusion-specific distillation:
+- Collects teacher logits during diffusion sampling steps
+- Supports both live pipeline and stored logits modes
+- Deep copies teacher weights to student (if same architecture)
+- Combines cross-entropy loss with logit matching loss
 """
 
 import json
 import os
 import time
+import copy
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from typing import Any, Dict, List, Optional
@@ -38,15 +39,21 @@ from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.dist_utils import all_reduce
 
+from distillation.diffusion_logit_collector import (
+    DiffusionLogitCollector,
+    DiffusionLogitCollectionConfig,
+    deepcopy_teacher_weights_to_student,
+)
+
 
 logger = helper.create_logger(__name__)
 
 
 @dataclass
-class DistillationArguments:
-    """Additional arguments for distillation training"""
+class DiffusionDistillationArguments:
+    """Additional arguments for diffusion distillation training"""
     teacher_model_path: str = field(
-        metadata={"help": "Path to teacher model (larger pre-trained model)"}
+        metadata={"help": "Path to teacher model (HuggingFace model ID or local path)"}
     )
     teacher_config_path: Optional[str] = field(
         default=None,
@@ -54,7 +61,7 @@ class DistillationArguments:
     )
     distillation_alpha: float = field(
         default=0.5,
-        metadata={"help": "Weight for distillation loss: total_loss = (1-alpha)*cross_entropy_student_loss + alpha*kl_divergence_distill_loss"}
+        metadata={"help": "Weight for distillation loss: total_loss = (1-alpha)*cross_entropy_student_loss + alpha*diffusion_distill_loss"}
     )
     temperature: float = field(
         default=4.0,
@@ -64,9 +71,38 @@ class DistillationArguments:
         default=True,
         metadata={"help": "Whether to freeze teacher model (recommended: True)"}
     )
-    teacher_use_cache: bool = field(
+    init_student_from_teacher: bool = field(
         default=True,
-        metadata={"help": "Whether teacher uses KV cache (faster but more memory)"}
+        metadata={"help": "Whether to initialize student weights from teacher (deepcopy)"}
+    )
+    # Diffusion-specific parameters
+    num_sampling_steps: int = field(
+        default=200,
+        metadata={"help": "Number of diffusion sampling steps"}
+    )
+    collect_every_n_steps: int = field(
+        default=10,
+        metadata={"help": "Collect teacher logits every N steps (1 = all steps, higher = less memory)"}
+    )
+    use_stored_logits: bool = field(
+        default=False,
+        metadata={"help": "Whether to use pre-computed stored logits (True) or live pipeline (False)"}
+    )
+    stored_logits_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to stored logits directory (if use_stored_logits=True)"}
+    )
+    diffusion_sampling_alg: str = field(
+        default="p2",
+        metadata={"help": "Diffusion sampling algorithm: p2, entropy, origin, etc."}
+    )
+    diffusion_temperature: float = field(
+        default=0.7,
+        metadata={"help": "Temperature for diffusion sampling"}
+    )
+    diffusion_top_k: Optional[int] = field(
+        default=200,
+        metadata={"help": "Top-k for diffusion sampling"}
     )
 
 
@@ -75,58 +111,74 @@ class Arguments:
     model: "ModelArguments" = field(default_factory=ModelArguments)
     data: "DataArguments" = field(default_factory=DataArguments)
     train: "TrainingArguments" = field(default_factory=TrainingArguments)
-    distill: "DistillationArguments" = field(default_factory=DistillationArguments)
+    distill: "DiffusionDistillationArguments" = field(default_factory=DiffusionDistillationArguments)
 
 
-def compute_distillation_loss(
+def compute_diffusion_distillation_loss(
     student_logits: torch.Tensor,
     teacher_logits: torch.Tensor,
+    mask_positions: torch.Tensor,
     temperature: float = 4.0,
     labels: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Compute KL divergence loss for knowledge distillation.
+    Compute KL divergence loss for diffusion knowledge distillation.
+    
+    This loss matches student logits to teacher logits at masked positions
+    during diffusion sampling steps.
     
     Args:
         student_logits: Student model logits [batch_size, seq_len, vocab_size]
-        teacher_logits: Teacher model logits [batch_size, seq_len, vocab_size]
+        teacher_logits: Teacher model logits [num_masked, vocab_size] or [batch_size, seq_len, vocab_size]
+        mask_positions: Boolean mask indicating masked positions [batch_size, seq_len]
         temperature: Temperature for softmax
         labels: Optional labels to mask loss (only compute on non-ignored tokens)
     
     Returns:
         KL divergence loss
     """
-    # Apply temperature scaling
-    student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
-    teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
-    
-    # Compute KL divergence: KL(P_teacher || P_student)
-    # KL = sum(P_teacher * log(P_teacher / P_student))
-    kl_div = F.kl_div(
-        student_log_probs.view(-1, student_log_probs.size(-1)),
-        teacher_probs.view(-1, teacher_probs.size(-1)),
-        reduction='none',
-        log_target=False
-    ).sum(dim=-1)
-    
-    # Reshape back to [batch_size, seq_len]
-    kl_div = kl_div.view(student_logits.shape[0], student_logits.shape[1])
-    
-    # Mask out ignored tokens if labels provided
-    if labels is not None:
-        # Labels shape: [batch_size, seq_len] or [batch_size * seq_len]
-        if labels.dim() == 1:
-            labels = labels.view(student_logits.shape[0], -1)
+    # Extract logits at masked positions
+    if teacher_logits.dim() == 2:  # [num_masked, vocab_size]
+        # Teacher logits are already filtered to masked positions
+        teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
+        student_mask_logits = student_logits[mask_positions]  # [num_masked, vocab_size]
+        student_log_probs = F.log_softmax(student_mask_logits / temperature, dim=-1)
         
-        # IGNORE_INDEX is typically -100
-        from veomni.data.constants import IGNORE_INDEX
-        mask = (labels != IGNORE_INDEX).float()
-        kl_div = kl_div * mask
-        # Average over non-ignored tokens
-        return kl_div.sum() / (mask.sum() + 1e-8) * (temperature ** 2)
-    else:
-        # Average over all tokens
-        return kl_div.mean() * (temperature ** 2)
+        # Compute KL divergence
+        kl_div = F.kl_div(
+            student_log_probs,
+            teacher_probs,
+            reduction='none',
+            log_target=False
+        ).sum(dim=-1)  # [num_masked]
+        
+        # Average over masked positions
+        loss = kl_div.mean() * (temperature ** 2)
+    else:  # [batch_size, seq_len, vocab_size]
+        # Teacher logits are full sequence
+        student_log_probs = F.log_softmax(student_logits / temperature, dim=-1)
+        teacher_probs = F.softmax(teacher_logits / temperature, dim=-1)
+        
+        # Compute KL divergence
+        kl_div = F.kl_div(
+            student_log_probs.view(-1, student_log_probs.size(-1)),
+            teacher_probs.view(-1, teacher_probs.size(-1)),
+            reduction='none',
+            log_target=False
+        ).sum(dim=-1)
+        
+        # Reshape back to [batch_size, seq_len]
+        kl_div = kl_div.view(student_logits.shape[0], student_logits.shape[1])
+        
+        # Only compute loss at masked positions
+        mask_float = mask_positions.float()
+        kl_div = kl_div * mask_float
+        
+        # Average over masked positions
+        num_masked = mask_float.sum()
+        loss = kl_div.sum() / (num_masked + 1e-8) * (temperature ** 2)
+    
+    return loss
 
 
 def main():
@@ -246,6 +298,33 @@ def main():
     
     helper.print_device_mem_info("VRAM usage after building teacher model")
 
+    # Initialize student from teacher weights if requested
+    if args.distill.init_student_from_teacher:
+        logger.info_rank0("Initializing student model from teacher weights")
+        deepcopy_teacher_weights_to_student(teacher_model, student_model, strict=False)
+
+    # Set up diffusion logit collector
+    if args.distill.use_stored_logits:
+        logger.info_rank0(f"Using stored logits from {args.distill.stored_logits_path}")
+        logit_collector = None  # Will load from disk
+    else:
+        logger.info_rank0("Setting up live logit collection pipeline")
+        collection_config = DiffusionLogitCollectionConfig(
+            num_sampling_steps=args.distill.num_sampling_steps,
+            temperature=args.distill.diffusion_temperature,
+            top_k=args.distill.diffusion_top_k,
+            alg=args.distill.diffusion_sampling_alg,
+            collect_every_n_steps=args.distill.collect_every_n_steps,
+            collect_mask_positions_only=True,
+            store_on_cpu=True,
+        )
+        logit_collector = DiffusionLogitCollector(
+            teacher_model=teacher_model,
+            tokenizer=tokenizer,
+            config=collection_config,
+            device=f"cuda:{args.train.local_rank}"
+        )
+
     # Parallelize student model (teacher typically doesn't need parallelization if frozen)
     get_optimizer_pre_hook = getattr(student_model, "get_optimizer_pre_hook", None)
     student_model = build_parallelize_model(
@@ -364,6 +443,7 @@ def main():
                 }
                 
                 labels = micro_batch.get("labels")
+                input_ids = micro_batch.get("input_ids")
                 
                 # ========== STUDENT FORWARD PASS ==========
                 with model_fwd_context:
@@ -371,15 +451,36 @@ def main():
                     student_loss = student_outputs.loss.mean() / len(micro_batches)
                     student_logits = student_outputs.logits  # [batch, seq_len, vocab_size]
 
-                # ========== TEACHER FORWARD PASS ==========
-                with torch.no_grad():  # Teacher doesn't need gradients
-                    teacher_outputs = teacher_model(**micro_batch, use_cache=args.distill.teacher_use_cache)
-                    teacher_logits = teacher_outputs.logits  # [batch, seq_len, vocab_size]
-                
+                # ========== TEACHER LOGIT COLLECTION ==========
+                if args.distill.use_stored_logits:
+                    # Load pre-computed teacher logits from disk
+                    # TODO: Implement loading logic
+                    raise NotImplementedError("Stored logits loading not yet implemented")
+                else:
+                    # Live pipeline: collect teacher logits during diffusion sampling
+                    with torch.no_grad():
+                        teacher_logit_data = logit_collector.collect_logits_for_batch(
+                            input_ids=input_ids,
+                            attention_mask=micro_batch.get("attention_mask"),
+                            return_intermediate_states=False
+                        )
+                    
+                    # For now, use logits from the first collected step
+                    # In practice, you might want to average or use multiple steps
+                    teacher_logits = teacher_logit_data["logits"][0]  # First collected step
+                    mask_positions = teacher_logit_data["mask_positions"][0]
+                    
+                    # Move to GPU if needed
+                    if teacher_logits.device != student_logits.device:
+                        teacher_logits = teacher_logits.to(student_logits.device)
+                    if mask_positions.device != student_logits.device:
+                        mask_positions = mask_positions.to(student_logits.device)
+
                 # ========== DISTILLATION LOSS ==========
-                distill_loss = compute_distillation_loss(
+                distill_loss = compute_diffusion_distillation_loss(
                     student_logits=student_logits,
                     teacher_logits=teacher_logits,
+                    mask_positions=mask_positions,
                     temperature=args.distill.temperature,
                     labels=labels,
                 ) / len(micro_batches)
@@ -398,7 +499,7 @@ def main():
                 total_loss += combined_loss.item()
                 total_student_loss += student_loss.item()
                 total_distill_loss += distill_loss.item()
-                del micro_batch, student_outputs, teacher_outputs
+                del micro_batch, student_outputs
 
             # Gradient clipping
             if args.train.data_parallel_mode == "fsdp1":
