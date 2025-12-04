@@ -1,1 +1,10 @@
-transformers
+# Requirements for simple_distill.py
+# Step-wise diffusion distillation for Open-dCoder models
+
+torch>=2.0.0
+transformers>=4.54.1
+datasets>=2.0.0
+tqdm>=4.0.0
+torchdata
+# Note: veomni is part of the Open-dLLM repo and should be installed via:
+# pip install -e .

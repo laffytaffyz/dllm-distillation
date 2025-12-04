@@ -15,16 +15,18 @@ from datasets import load_dataset
 from tqdm import tqdm
 
 # Import the custom model and generation config
-try:
-    from veomni.models.transformers.qwen2.modeling_qwen2 import Qwen2ForCausalLM
-    from veomni.models.transformers.qwen2.generation_utils import MDMGenerationConfig, sample_tokens
-except ImportError:
-    print("Warning: veomni not found. Trying alternative import...")
-    import sys
-    sys.path.insert(0, '.')
-    from veomni.models.transformers.qwen2.modeling_qwen2 import Qwen2ForCausalLM
-    from veomni.models.transformers.qwen2.generation_utils import MDMGenerationConfig, sample_tokens
+# Add parent directory (repo root) to path so we can import veomni
+import os
+import sys
+script_dir = os.path.dirname(os.path.abspath(__file__))
+repo_root = os.path.dirname(script_dir)  # Go up one level from distillation/ to repo root
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
 
+from veomni.models.transformers.qwen2.modeling_qwen2 import Qwen2ForCausalLM
+from veomni.models.transformers.qwen2.generation_utils import MDMGenerationConfig, sample_tokens
+
+# INIT TEACHER AND STUDENTS --------------------
 # Configuration
 TEACHER_MODEL = "fredzzp/open-dcoder-0.5B"
 STUDENT_MODEL = "fredzzp/open-dcoder-0.5B"  # Can be same or different
@@ -94,21 +96,89 @@ for param in teacher_model.parameters():
 # Setup optimizer
 optimizer = torch.optim.AdamW(student_model.parameters(), lr=LEARNING_RATE)
 
-# Load dataset
-print("Loading dataset...")
+
+# DATASET LOADING --------------------
+# Load dataset - using FineCode (same as Open-dLLM repo)
+print("Loading FineCode dataset (fredzzp/fine_code)...")
+print("Dataset size: ~95.7 GB (43.2M examples, 192 files)")
+print("To download locally, run:")
+print("  python3 scripts/download_hf_data.py --repo_id fredzzp/fine_code --local_dir ./data --max_workers 4")
+print()
+
+DATASET_NAME = "fredzzp/fine_code"
+USE_STREAMING = True  # Set to False to use local download (requires ~96GB free space)
+LOCAL_DATA_DIR = "./data/fine_code"  # Path to downloaded data
+
 try:
-    dataset = load_dataset("bigcode/the-stack-dedup", data_dir="data/python", split="train[:500]")
-    def tokenize_function(examples):
-        return teacher_tokenizer(
-            examples["content"],
-            truncation=True,
-            max_length=MAX_SEQ_LEN,
-            padding="max_length"
+    if USE_STREAMING:
+        # Streaming mode - loads on-the-fly, no download
+        print("Using streaming mode (no local download)...")
+        dataset = load_dataset(DATASET_NAME, streaming=True, split="train")
+        # Take first N samples for training
+        dataset_samples = []
+        for i, sample in enumerate(dataset):
+            if i >= 1000:  # Limit for demo - remove this for full training
+                break
+            dataset_samples.append(sample)
+        
+        # Extract text - try common keys
+        texts = []
+        for sample in dataset_samples:
+            text = sample.get("text") or sample.get("content") or sample.get("code") or ""
+            if text:
+                texts.append(text)
+    else:
+        # Load from local directory if downloaded
+        print(f"Loading from local directory: {LOCAL_DATA_DIR}")
+        try:
+            # Try loading from local parquet files (FineCode format)
+            import glob
+            parquet_files = glob.glob(f"{LOCAL_DATA_DIR}/data/train-*.parquet")
+            if parquet_files:
+                print(f"Found {len(parquet_files)} parquet files locally")
+                # Load first few files for demo (remove limit for full training)
+                dataset = load_dataset("parquet", data_files=parquet_files[:10], split="train[:1000]")
+            else:
+                # Try JSONL format
+                jsonl_files = glob.glob(f"{LOCAL_DATA_DIR}/data/*.jsonl")
+                if jsonl_files:
+                    dataset = load_dataset("json", data_files=jsonl_files[:10], split="train[:1000]")
+                else:
+                    raise FileNotFoundError(f"No data files found in {LOCAL_DATA_DIR}")
+        except Exception as e:
+            print(f"Could not load from local directory: {e}")
+            print("Falling back to HuggingFace download...")
+            dataset = load_dataset(DATASET_NAME, split="train[:1000]")
+        
+        # Extract text - try common keys
+        text_key = "text" if "text" in dataset.column_names else (
+            "content" if "content" in dataset.column_names else dataset.column_names[0]
         )
-    tokenized_dataset = dataset.map(tokenize_function, batched=True, remove_columns=dataset.column_names)
+        texts = dataset[text_key]
+    
+    # Filter out empty texts
+    texts = [t for t in texts if t and len(t.strip()) > 0]
+    
+    if len(texts) == 0:
+        raise ValueError("No valid text samples found in dataset")
+    
+    # Tokenize
+    print(f"Tokenizing {len(texts)} samples...")
+    tokenized_dataset = teacher_tokenizer(
+        texts,
+        truncation=True,
+        max_length=MAX_SEQ_LEN,
+        padding="max_length",
+        return_tensors="pt"
+    )
+    print(f"Successfully loaded and tokenized {len(texts)} samples")
+    
 except Exception as e:
-    print(f"Could not load dataset: {e}")
-    print("Creating dummy data...")
+    print(f"Could not load FineCode dataset: {e}")
+    print("\nTo download FineCode dataset:")
+    print("  python3 scripts/download_hf_data.py --repo_id fredzzp/fine_code --local_dir ./data")
+    print("\nOr use streaming mode (set USE_STREAMING=True in script)")
+    print("\nCreating dummy data for demonstration...")
     dummy_texts = ["def hello():\n    print('hello')", "def world():\n    print('world')"] * 50
     tokenized_dataset = teacher_tokenizer(
         dummy_texts,
@@ -117,6 +187,7 @@ except Exception as e:
         padding="max_length",
         return_tensors="pt"
     )
+
 
 
 def run_diffusion_with_logit_collection(
