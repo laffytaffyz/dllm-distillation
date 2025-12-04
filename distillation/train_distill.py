@@ -39,20 +39,11 @@ from veomni.utils import helper
 from veomni.utils.arguments import DataArguments, ModelArguments, TrainingArguments, parse_args, save_args
 from veomni.utils.dist_utils import all_reduce
 
-# Import diffusion logit collector utilities
-# Try relative import first (if running from distillation/), then absolute (if running from project root)
+# Import deepcopy utility (only function we need from diffusion_logit_collector)
 try:
-    from diffusion_logit_collector import (
-        DiffusionLogitCollector,
-        DiffusionLogitCollectionConfig,
-        deepcopy_teacher_weights_to_student,
-    )
+    from diffusion_logit_collector import deepcopy_teacher_weights_to_student
 except ImportError:
-    from distillation.diffusion_logit_collector import (
-        DiffusionLogitCollector,
-        DiffusionLogitCollectionConfig,
-        deepcopy_teacher_weights_to_student,
-    )
+    from distillation.diffusion_logit_collector import deepcopy_teacher_weights_to_student
 
 
 logger = helper.create_logger(__name__)
@@ -87,35 +78,7 @@ class DistillationArguments:
     # Diffusion-specific parameters
     use_diffusion_sampling: bool = field(
         default=True,
-        metadata={"help": "Whether to use diffusion sampling (True) or simple forward pass (False)"}
-    )
-    num_sampling_steps: int = field(
-        default=200,
-        metadata={"help": "Number of diffusion sampling steps"}
-    )
-    collect_every_n_steps: int = field(
-        default=10,
-        metadata={"help": "Collect teacher logits every N steps (1 = all steps, higher = less memory)"}
-    )
-    use_stored_logits: bool = field(
-        default=False,
-        metadata={"help": "Whether to use pre-computed stored logits (True) or live pipeline (False)"}
-    )
-    stored_logits_path: Optional[str] = field(
-        default=None,
-        metadata={"help": "Path to stored logits directory (if use_stored_logits=True)"}
-    )
-    diffusion_sampling_alg: str = field(
-        default="p2",
-        metadata={"help": "Diffusion sampling algorithm: p2, entropy, origin, etc."}
-    )
-    diffusion_temperature: float = field(
-        default=0.7,
-        metadata={"help": "Temperature for diffusion sampling"}
-    )
-    diffusion_top_k: Optional[int] = field(
-        default=200,
-        metadata={"help": "Top-k for diffusion sampling"}
+        metadata={"help": "Whether to use diffusion-aware distillation (uses is_causal=False for bidirectional attention)"}
     )
 
 
@@ -329,31 +292,11 @@ def main():
         logger.info_rank0("Initializing student model from teacher weights")
         deepcopy_teacher_weights_to_student(teacher_model, student_model, strict=False)
 
-    # Set up diffusion logit collector if using diffusion sampling
-    logit_collector = None
+    # Note: We no longer need the diffusion logit collector for simple distillation
+    # A single forward pass on masked input is sufficient to get teacher logits
+    # The diffusion loop is only needed for generation, not for distillation
     if args.distill.use_diffusion_sampling:
-        if args.distill.use_stored_logits:
-            logger.info_rank0(f"Using stored logits from {args.distill.stored_logits_path}")
-            # TODO: Implement loading logic for stored logits
-            if args.distill.stored_logits_path is None:
-                raise ValueError("stored_logits_path must be provided when use_stored_logits=True")
-        else:
-            logger.info_rank0("Setting up live logit collection pipeline")
-            collection_config = DiffusionLogitCollectionConfig(
-                num_sampling_steps=args.distill.num_sampling_steps,
-                temperature=args.distill.diffusion_temperature,
-                top_k=args.distill.diffusion_top_k,
-                alg=args.distill.diffusion_sampling_alg,
-                collect_every_n_steps=args.distill.collect_every_n_steps,
-                collect_mask_positions_only=True,
-                store_on_cpu=True,
-            )
-            logit_collector = DiffusionLogitCollector(
-                teacher_model=teacher_model,
-                tokenizer=tokenizer,
-                config=collection_config,
-                device=f"cuda:{args.train.local_rank}"
-            )
+        logger.info_rank0("Using diffusion-aware distillation (single forward pass on masked input)")
 
     # Parallelize student model (teacher typically doesn't need parallelization if frozen)
     get_optimizer_pre_hook = getattr(student_model, "get_optimizer_pre_hook", None)
@@ -482,35 +425,30 @@ def main():
                     student_logits = student_outputs.logits  # [batch, seq_len, vocab_size]
 
                 # ========== TEACHER LOGIT COLLECTION ==========
+                # For diffusion models, we can get logits from a single forward pass on masked input
+                # The model will predict logits for masked positions directly
                 mask_positions = None
-                if args.distill.use_diffusion_sampling:
-                    if args.distill.use_stored_logits:
-                        # Load pre-computed teacher logits from disk
-                        # TODO: Implement loading logic
-                        raise NotImplementedError("Stored logits loading not yet implemented")
-                    else:
-                        # Live pipeline: collect teacher logits during diffusion sampling
-                        with torch.no_grad():
-                            teacher_logit_data = logit_collector.collect_logits_for_batch(
-                                input_ids=input_ids,
-                                attention_mask=micro_batch.get("attention_mask"),
-                                return_intermediate_states=False
-                            )
-                        
-                        # Use logits from the first collected step (can be extended to use multiple steps)
-                        teacher_logits = teacher_logit_data["logits"][0]  # First collected step
-                        mask_positions = teacher_logit_data["mask_positions"][0]
-                        
-                        # Move to GPU if needed
-                        if teacher_logits.device != student_logits.device:
-                            teacher_logits = teacher_logits.to(student_logits.device)
-                        if mask_positions.device != student_logits.device:
-                            mask_positions = mask_positions.to(student_logits.device)
-                else:
-                    # Standard forward pass (non-diffusion)
-                    with torch.no_grad():
-                        teacher_outputs = teacher_model(**micro_batch, use_cache=False)
-                        teacher_logits = teacher_outputs.logits  # [batch, seq_len, vocab_size]
+                with torch.no_grad():
+                    # Single forward pass - model outputs logits for all positions including masks
+                    teacher_outputs = teacher_model(
+                        input_ids=input_ids,
+                        attention_mask=micro_batch.get("attention_mask"),
+                        use_cache=False,
+                        is_causal=False  # Bidirectional attention for diffusion models
+                    )
+                    teacher_logits = teacher_outputs.logits  # [batch, seq_len, vocab_size]
+                    
+                    # CRITICAL: Shift logits to align with training (as in generation_utils.py)
+                    # This is needed because diffusion models predict next token, so we shift
+                    teacher_logits = torch.cat([teacher_logits[:, :1], teacher_logits[:, :-1]], dim=1)
+                    
+                    # Extract mask positions if using diffusion-aware distillation
+                    if args.distill.use_diffusion_sampling:
+                        mask_token_id = tokenizer.mask_token_id
+                        if mask_token_id is not None:
+                            mask_positions = (input_ids == mask_token_id)
+                            # Optionally filter to only masked positions for distillation
+                            # (or use all positions - both work)
                 
                 # ========== DISTILLATION LOSS ==========
                 distill_loss = compute_distillation_loss(
