@@ -18,7 +18,19 @@ import numpy as np
 import torch
 from transformers import BatchFeature, ProcessorMixin
 from transformers.image_transforms import center_crop, resize
-from transformers.image_utils import ImageInput, PILImageResampling, make_list_of_images, to_numpy_array
+from transformers.image_utils import ImageInput, make_list_of_images, to_numpy_array
+try:
+    from transformers.image_utils import PILImageResampling
+except ImportError:
+    # PILImageResampling was removed in newer transformers versions
+    # Use a simple constant - BICUBIC = 3 (PIL.Image.Resampling.BICUBIC)
+    try:
+        from PIL import Image
+        PILImageResampling = Image.Resampling
+    except ImportError:
+        # Fallback: use integer constant if PIL not available
+        class PILImageResampling:
+            BICUBIC = 3
 
 
 class MoVQGANProcessor(ProcessorMixin):

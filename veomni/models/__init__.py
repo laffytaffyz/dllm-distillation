@@ -16,13 +16,23 @@
 from . import transformers
 from .auto import build_foundation_model, build_processor, build_tokenizer
 from .module_utils import init_empty_weights, load_model_weights, save_model_assets, save_model_weights
-from .seed_omni import build_omni_model, build_omni_processor
+
+# Lazy import seed_omni to avoid PIL/PILImageResampling import errors when not needed
+# (seed_omni requires PIL which may not be installed for text-only models)
+def __getattr__(name):
+    if name in ("build_omni_model", "build_omni_processor"):
+        from .seed_omni import build_omni_model, build_omni_processor
+        if name == "build_omni_model":
+            return build_omni_model
+        elif name == "build_omni_processor":
+            return build_omni_processor
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
     "build_foundation_model",
-    "build_omni_model",
-    "build_omni_processor",
+    "build_omni_model",  # Lazy import via __getattr__
+    "build_omni_processor",  # Lazy import via __getattr__
     "build_processor",
     "build_tokenizer",
     "init_empty_weights",
@@ -30,5 +40,4 @@ __all__ = [
     "save_model_assets",
     "save_model_weights",
     "transformers",
-    "seed_omni",
 ]
