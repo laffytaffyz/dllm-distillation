@@ -6,5 +6,19 @@ transformers>=4.54.1
 datasets>=2.0.0
 tqdm>=4.0.0
 torchdata
+
+#blobfile>=3.0.0  # Optional: Only needed for cloud storage access during training
+#bytecheckpoint  # Optional: Only needed for checkpointing during training. Requires torch<=2.5.0. Alternative: use ckpt_manager="dcp"
+#byted-hdfs-io # Optional: Only needed for HDFS access during training. https://www.piwheels.org/project/byted-hdfs-io/
+datasets>=2.16.0
+#diffusers>=0.30.0,<=0.31.0  # Optional: Only needed for certain model types
+#flash-attn>=2.6.3  # Optional: speeds up training but requires CUDA and compilation
+#liger-kernel>=0.5.5  # Optional: Performance optimizations. Requires triton>=2.3.1 (may not work on macOS)
+packaging>=23.0,<26.0
+tiktoken>=0.9.0
+#torchdata>=0.8.0,<1.0  # Optional: Only needed for advanced data loading during training
+transformers[torch]==4.54.1
+wandb
+
 # Note: veomni is part of the Open-dLLM repo and should be installed via:
 # pip install -e .
