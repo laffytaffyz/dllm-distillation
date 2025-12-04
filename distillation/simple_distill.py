@@ -31,7 +31,7 @@ from veomni.models.transformers.qwen2.generation_utils import MDMGenerationConfi
 TEACHER_MODEL = "fredzzp/open-dcoder-0.5B"
 STUDENT_MODEL = "fredzzp/open-dcoder-0.5B"  # Can be same or different
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 2  # Smaller batch size due to memory requirements
+BATCH_SIZE = 1  # Very small batch size due to memory requirements (2 models + diffusion steps)
 LEARNING_RATE = 5e-5
 NUM_EPOCHS = 1
 DISTILLATION_ALPHA = 0.5  # Weight for distillation loss
@@ -164,13 +164,15 @@ try:
     
     # Tokenize
     print(f"Tokenizing {len(texts)} samples...")
-    tokenized_dataset = teacher_tokenizer(
+    tokenized_output = teacher_tokenizer(
         texts,
         truncation=True,
         max_length=MAX_SEQ_LEN,
         padding="max_length",
         return_tensors="pt"
     )
+    # Extract input_ids tensor - this is what we need for training
+    tokenized_dataset = {"input_ids": tokenized_output["input_ids"]}
     print(f"Successfully loaded and tokenized {len(texts)} samples")
     
 except Exception as e:
@@ -255,10 +257,11 @@ def run_diffusion_with_logit_collection(
             logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
             
             # Collect logits if this is a collection step
+            # Move to CPU to save GPU memory (will move back when needed)
             if step % collect_every_n == 0:
-                collected_logits.append(logits.clone())
-                collected_mask_positions.append(mask_index.clone())
-                collected_states.append(x_t.clone())
+                collected_logits.append(logits.detach().cpu())
+                collected_mask_positions.append(mask_index.cpu())
+                collected_states.append(x_t.cpu())
             
             # Update x_t using p2 algorithm (same as generation_utils.py)
             mask_logits = logits[mask_index]
@@ -318,17 +321,19 @@ print("Starting training...")
 mask_token_id = teacher_tokenizer.mask_token_id
 
 # Create dataloader
+# Extract input_ids tensor from tokenized output
 if isinstance(tokenized_dataset, dict):
     input_ids = tokenized_dataset["input_ids"]
-    num_batches = (len(input_ids) + BATCH_SIZE - 1) // BATCH_SIZE
-    dataset_type = "dict"
 else:
-    dataloader = torch.utils.data.DataLoader(
-        tokenized_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True
-    )
-    dataset_type = "dataloader"
+    # Handle BatchEncoding or other tokenizer output types
+    input_ids = tokenized_dataset["input_ids"] if hasattr(tokenized_dataset, "__getitem__") else tokenized_dataset.input_ids
+
+# Ensure input_ids is a tensor
+if not isinstance(input_ids, torch.Tensor):
+    input_ids = torch.tensor(input_ids)
+
+num_batches = (len(input_ids) + BATCH_SIZE - 1) // BATCH_SIZE
+dataset_type = "dict"
 
 for epoch in range(NUM_EPOCHS):
     total_loss = 0
@@ -336,18 +341,12 @@ for epoch in range(NUM_EPOCHS):
     total_distill_loss = 0
     num_batches_processed = 0
     
-    if dataset_type == "dict":
-        batch_iter = range(num_batches)
-    else:
-        batch_iter = dataloader
+    batch_iter = range(num_batches)
     
     for batch_idx in tqdm(batch_iter, desc=f"Epoch {epoch+1}"):
-        if dataset_type == "dict":
-            start_idx = batch_idx * BATCH_SIZE
-            end_idx = min(start_idx + BATCH_SIZE, len(input_ids))
-            batch_input_ids = input_ids[start_idx:end_idx].to(DEVICE)
-        else:
-            batch_input_ids = batch_idx["input_ids"].to(DEVICE)
+        start_idx = batch_idx * BATCH_SIZE
+        end_idx = min(start_idx + BATCH_SIZE, len(input_ids))
+        batch_input_ids = input_ids[start_idx:end_idx].to(DEVICE)
         
         # Prepare input: use first part as prompt, rest will be masked
         prompt_len = batch_input_ids.shape[1] // 2  # Use half as prompt
@@ -370,13 +369,17 @@ for epoch in range(NUM_EPOCHS):
         # We should have 64 teacher logits (128 steps / 2)
         assert len(teacher_logits_list) == STUDENT_STEPS, f"Expected {STUDENT_STEPS} teacher logits, got {len(teacher_logits_list)}"
         
+        # Clear GPU cache after teacher forward pass
+        torch.cuda.empty_cache()
+        
         # ========== STUDENT: Run 64 steps, collect at each step ==========
         student_logits_list = []
         student_mask_positions_list = []
         student_states_list = []
         
         # Initialize student's x_t from teacher's first state (same starting point)
-        x_t_student = teacher_states_list[0].clone()
+        # Move back to GPU
+        x_t_student = teacher_states_list[0].to(DEVICE)
         fix_mask = (x_t_student != mask_token_id)
         attention_mask = (x_t_student != student_tokenizer.pad_token_id).long() if student_tokenizer.pad_token_id is not None else None
         
@@ -447,10 +450,11 @@ for epoch in range(NUM_EPOCHS):
         distill_losses = []
         for i in range(min(len(student_logits_list), len(teacher_logits_list))):
             student_logits = student_logits_list[i]
-            teacher_logits = teacher_logits_list[i]  # Teacher logit at step 2*i
+            # Move teacher logits back to GPU for loss computation
+            teacher_logits = teacher_logits_list[i].to(DEVICE)  # Teacher logit at step 2*i
             
             student_mask = student_mask_positions_list[i]
-            teacher_mask = teacher_mask_positions_list[i]
+            teacher_mask = teacher_mask_positions_list[i].to(DEVICE)
             
             # Only compute loss at masked positions
             # Extract logits at masked positions
@@ -481,8 +485,9 @@ for epoch in range(NUM_EPOCHS):
         # Standard student loss (cross-entropy on final prediction)
         # Use the last student state to compute standard loss
         if len(student_states_list) > 0:
+            # Move final state back to GPU
             final_student_outputs = student_model(
-                input_ids=student_states_list[-1],
+                input_ids=student_states_list[-1].to(DEVICE),
                 attention_mask=attention_mask,
                 is_causal=False
             )
@@ -505,9 +510,20 @@ for epoch in range(NUM_EPOCHS):
         combined_loss.backward()
         optimizer.step()
         
-        total_loss += combined_loss.item()
-        total_student_loss += student_loss.item()
-        total_distill_loss += distill_loss.item()
+        # Store loss values before deleting tensors
+        loss_val = combined_loss.item()
+        student_loss_val = student_loss.item()
+        distill_loss_val = distill_loss.item()
+        
+        # Clear GPU cache and delete intermediate tensors to free memory
+        del teacher_logits_list, teacher_mask_positions_list, teacher_states_list
+        del student_logits_list, student_mask_positions_list, student_states_list
+        del combined_loss, student_loss, distill_loss
+        torch.cuda.empty_cache()
+        
+        total_loss += loss_val
+        total_student_loss += student_loss_val
+        total_distill_loss += distill_loss_val
         num_batches_processed += 1
     
     print(f"\nEpoch {epoch+1} Summary:")
