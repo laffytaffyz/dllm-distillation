@@ -13,6 +13,9 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer
 from datasets import load_dataset
 from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader, IterableDataset
+import os
+import json
 
 # Import the custom model and generation config
 # Add parent directory (repo root) to path so we can import veomni
@@ -28,10 +31,14 @@ from veomni.models.transformers.qwen2.generation_utils import MDMGenerationConfi
 
 # INIT TEACHER AND STUDENTS --------------------
 # Configuration
-TEACHER_MODEL = "fredzzp/open-dcoder-0.5B"
-STUDENT_MODEL = "fredzzp/open-dcoder-0.5B"  # Can be same or different
+# Model paths: Can be HuggingFace model ID (e.g., "fredzzp/open-dcoder-0.5B") or local path
+# Set to None to use HuggingFace model ID, or provide local path for faster loading
+TEACHER_MODEL_PATH = '/orcd/data/tpoggio/001/tiffany8/dllm-distillation/models/open-dcoder-0.5B'  # e.g., "/path/to/local/open-dcoder-0.5B" or None for HuggingFace
+STUDENT_MODEL_PATH = '/orcd/data/tpoggio/001/tiffany8/dllm-distillation/models/open-dcoder-0.5B'  # e.g., "/path/to/local/open-dcoder-0.5B" or None for HuggingFace
+TEACHER_MODEL = "fredzzp/open-dcoder-0.5B"  # HuggingFace model ID (used if TEACHER_MODEL_PATH is None)
+STUDENT_MODEL = "fredzzp/open-dcoder-0.5B"  # HuggingFace model ID (used if STUDENT_MODEL_PATH is None)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-BATCH_SIZE = 1  # Very small batch size due to memory requirements (2 models + diffusion steps)
+BATCH_SIZE = 8 
 LEARNING_RATE = 5e-5
 NUM_EPOCHS = 1
 DISTILLATION_ALPHA = 0.5  # Weight for distillation loss
@@ -46,10 +53,25 @@ ALG = "p2"  # Sampling algorithm
 DIFFUSION_TEMP = 0.7  # Temperature for diffusion sampling
 TOP_K = 200
 
-print(f"Loading teacher model: {TEACHER_MODEL}")
-teacher_tokenizer = AutoTokenizer.from_pretrained(TEACHER_MODEL, trust_remote_code=True)
+# Dataset parameters
+MAX_SAMPLES = 100000
+
+# Checkpoint parameters
+CHECKPOINT_DIR = "./checkpoints"
+SAVE_CHECKPOINT_EVERY_N_BATCHES = 200  # Save checkpoint every N batches (0 to disable)
+SAVE_CHECKPOINT_EVERY_EPOCH = True  # Save checkpoint at end of each epoch
+RESUME_FROM_CHECKPOINT = None  # Path to checkpoint to resume from, or None to start fresh
+
+# Rollout printing parameters
+PRINT_ROLLOUTS_EVERY_N_BATCHES = 100  # Print teacher vs student rollouts every N batches (0 to disable)
+PRINT_ROLLOUTS_AT_STEPS = [0, 32, 63]  # Which student steps to print (0-indexed, max is STUDENT_STEPS-1)
+
+# Use local path if provided, otherwise use HuggingFace model ID
+teacher_model_path = TEACHER_MODEL_PATH if TEACHER_MODEL_PATH is not None else TEACHER_MODEL
+print(f"Loading teacher model: {teacher_model_path} {'(local)' if TEACHER_MODEL_PATH else '(HuggingFace)'}")
+teacher_tokenizer = AutoTokenizer.from_pretrained(teacher_model_path, trust_remote_code=True)
 teacher_model = Qwen2ForCausalLM.from_pretrained(
-    TEACHER_MODEL,
+    teacher_model_path,
     trust_remote_code=True,
     torch_dtype=torch.bfloat16
 ).to(DEVICE).eval()
@@ -59,10 +81,12 @@ if teacher_tokenizer.mask_token is None:
     teacher_tokenizer.add_special_tokens({"mask_token": "<M>"})
     teacher_model.resize_token_embeddings(len(teacher_tokenizer))
 
-print(f"Loading student model: {STUDENT_MODEL}")
-student_tokenizer = AutoTokenizer.from_pretrained(STUDENT_MODEL, trust_remote_code=True)
+# Use local path if provided, otherwise use HuggingFace model ID
+student_model_path = STUDENT_MODEL_PATH if STUDENT_MODEL_PATH is not None else STUDENT_MODEL
+print(f"Loading student model: {student_model_path} {'(local)' if STUDENT_MODEL_PATH else '(HuggingFace)'}")
+student_tokenizer = AutoTokenizer.from_pretrained(student_model_path, trust_remote_code=True)
 student_model = Qwen2ForCausalLM.from_pretrained(
-    STUDENT_MODEL,
+    student_model_path,
     trust_remote_code=True,
     torch_dtype=torch.bfloat16
 ).to(DEVICE).train()
@@ -97,6 +121,45 @@ for param in teacher_model.parameters():
 optimizer = torch.optim.AdamW(student_model.parameters(), lr=LEARNING_RATE)
 
 
+# Create IterableDataset class for streaming mode
+class StreamingTokenizedDataset(IterableDataset):
+    """Dataset that tokenizes on-the-fly for streaming mode"""
+    def __init__(self, dataset, tokenizer, max_length, max_samples=None):
+        self.dataset = dataset  # This is the streaming dataset iterator
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.max_samples = max_samples  # Limit number of samples
+    
+    def __iter__(self):
+        """Iterate through streaming dataset and tokenize on-the-fly"""
+        samples_yielded = 0
+        for sample in self.dataset:
+            # Check if we've reached the limit
+            if self.max_samples is not None and samples_yielded >= self.max_samples:
+                break
+            
+            # Extract text from sample
+            text = sample.get("text") or sample.get("content") or sample.get("code") or ""
+            if not text or len(text.strip()) == 0:
+                # Skip empty samples
+                continue
+            
+            # Tokenize on-the-fly
+            tokenized = self.tokenizer(
+                text,
+                truncation=True,
+                max_length=self.max_length,
+                padding="max_length",
+                return_tensors="pt"
+            )
+            yield {"input_ids": tokenized["input_ids"].squeeze(0)}
+            samples_yielded += 1
+
+
+# Note: TextDataset removed - now using streaming for both HuggingFace and local files
+# Streaming is faster and uses less memory for large datasets
+
+
 # DATASET LOADING --------------------
 # Load dataset - using FineCode (same as Open-dLLM repo)
 print("Loading FineCode dataset (fredzzp/fine_code)...")
@@ -106,89 +169,71 @@ print("  python3 scripts/download_hf_data.py --repo_id fredzzp/fine_code --local
 print()
 
 DATASET_NAME = "fredzzp/fine_code"
-USE_STREAMING = True  # Set to False to use local download (requires ~96GB free space)
-LOCAL_DATA_DIR = "./data/fine_code"  # Path to downloaded data
+USE_STREAMING = False  # Set to False to use local download (requires ~96GB free space)
+LOCAL_DATA_DIR = "/orcd/data/tpoggio/001/tiffany8/dllm-distillation/data"  # Path to downloaded data
 
 try:
     if USE_STREAMING:
         # Streaming mode - loads on-the-fly, no download
         print("Using streaming mode (no local download)...")
+        print("Note: Streaming mode tokenizes on-the-fly during training")
         dataset = load_dataset(DATASET_NAME, streaming=True, split="train")
-        # Take first N samples for training
-        dataset_samples = []
-        for i, sample in enumerate(dataset):
-            if i >= 1000:  # Limit for demo - remove this for full training
-                break
-            dataset_samples.append(sample)
         
-        # Extract text - try common keys
-        texts = []
-        for sample in dataset_samples:
-            text = sample.get("text") or sample.get("content") or sample.get("code") or ""
-            if text:
-                texts.append(text)
-    else:
-        # Load from local directory if downloaded
-        print(f"Loading from local directory: {LOCAL_DATA_DIR}")
-        try:
-            # Try loading from local parquet files (FineCode format)
-            import glob
-            parquet_files = glob.glob(f"{LOCAL_DATA_DIR}/data/train-*.parquet")
-            if parquet_files:
-                print(f"Found {len(parquet_files)} parquet files locally")
-                # Load first few files for demo (remove limit for full training)
-                dataset = load_dataset("parquet", data_files=parquet_files[:10], split="train[:1000]")
-            else:
-                # Try JSONL format
-                jsonl_files = glob.glob(f"{LOCAL_DATA_DIR}/data/*.jsonl")
-                if jsonl_files:
-                    dataset = load_dataset("json", data_files=jsonl_files[:10], split="train[:1000]")
-                else:
-                    raise FileNotFoundError(f"No data files found in {LOCAL_DATA_DIR}")
-        except Exception as e:
-            print(f"Could not load from local directory: {e}")
-            print("Falling back to HuggingFace download...")
-            dataset = load_dataset(DATASET_NAME, split="train[:1000]")
-        
-        # Extract text - try common keys
-        text_key = "text" if "text" in dataset.column_names else (
-            "content" if "content" in dataset.column_names else dataset.column_names[0]
+        # Create streaming dataset that tokenizes on-the-fly
+        tokenized_dataset = StreamingTokenizedDataset(
+            dataset,
+            teacher_tokenizer,
+            MAX_SEQ_LEN,
+            max_samples=MAX_SAMPLES
         )
-        texts = dataset[text_key]
-    
-    # Filter out empty texts
-    texts = [t for t in texts if t and len(t.strip()) > 0]
-    
-    if len(texts) == 0:
-        raise ValueError("No valid text samples found in dataset")
-    
-    # Tokenize
-    print(f"Tokenizing {len(texts)} samples...")
-    tokenized_output = teacher_tokenizer(
-        texts,
-        truncation=True,
-        max_length=MAX_SEQ_LEN,
-        padding="max_length",
-        return_tensors="pt"
-    )
-    # Extract input_ids tensor - this is what we need for training
-    tokenized_dataset = {"input_ids": tokenized_output["input_ids"]}
-    print(f"Successfully loaded and tokenized {len(texts)} samples")
+        if MAX_SAMPLES is not None:
+            print(f"Streaming dataset ready (will tokenize on-the-fly, limited to {MAX_SAMPLES:,} samples)")
+        else:
+            print("Streaming dataset ready (will tokenize on-the-fly, using all available samples)")
+    else:
+        # Load from local directory if downloaded - use streaming for efficiency
+        print(f"Loading from local directory: {LOCAL_DATA_DIR}")
+        print("Note: Using streaming mode for local files (tokenizes on-the-fly, lower memory usage)")
+        # Try loading from local parquet files (FineCode format)
+        import glob
+        parquet_files = glob.glob(f"{LOCAL_DATA_DIR}/data/train-*.parquet")
+        if parquet_files:
+            print(f"Found {len(parquet_files)} parquet files locally")
+            # Use streaming mode for local parquet files - faster and lower memory
+            dataset = load_dataset("parquet", data_files=parquet_files, split="train", streaming=True)
+        else:
+            # Try JSONL format
+            jsonl_files = glob.glob(f"{LOCAL_DATA_DIR}/data/*.jsonl")
+            if jsonl_files:
+                # Use streaming mode for local JSONL files
+                dataset = load_dataset("json", data_files=jsonl_files, split="train", streaming=True)
+            else:
+                raise FileNotFoundError(
+                    f"No data files found in {LOCAL_DATA_DIR}\n"
+                    f"Expected parquet files at {LOCAL_DATA_DIR}/data/train-*.parquet\n"
+                    f"or JSONL files at {LOCAL_DATA_DIR}/data/*.jsonl\n"
+                    f"To download the dataset, run:\n"
+                    f"  python3 scripts/download_hf_data.py --repo_id fredzzp/fine_code --local_dir ./data"
+                )
+        
+        # Create streaming dataset that tokenizes on-the-fly (same as HuggingFace streaming)
+        tokenized_dataset = StreamingTokenizedDataset(
+            dataset,
+            teacher_tokenizer,
+            MAX_SEQ_LEN,
+            max_samples=MAX_SAMPLES
+        )
+        if MAX_SAMPLES is not None:
+            print(f"Local streaming dataset ready (will tokenize on-the-fly, limited to {MAX_SAMPLES:,} samples)")
+        else:
+            print("Local streaming dataset ready (will tokenize on-the-fly, using all available samples)")
     
 except Exception as e:
     print(f"Could not load FineCode dataset: {e}")
     print("\nTo download FineCode dataset:")
     print("  python3 scripts/download_hf_data.py --repo_id fredzzp/fine_code --local_dir ./data")
     print("\nOr use streaming mode (set USE_STREAMING=True in script)")
-    print("\nCreating dummy data for demonstration...")
-    dummy_texts = ["def hello():\n    print('hello')", "def world():\n    print('world')"] * 50
-    tokenized_dataset = teacher_tokenizer(
-        dummy_texts,
-        truncation=True,
-        max_length=MAX_SEQ_LEN,
-        padding="max_length",
-        return_tensors="pt"
-    )
+    raise  # Re-raise the exception instead of falling back to dummy data
 
 
 
@@ -316,37 +361,135 @@ def run_diffusion_with_logit_collection(
     return collected_logits, collected_mask_positions, collected_states
 
 
+# Checkpoint saving and loading functions
+def save_checkpoint(student_model, optimizer, epoch, batch_idx, total_loss, student_loss, distill_loss, 
+                   checkpoint_dir, tokenizer):
+    """Save a training checkpoint"""
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch}_batch_{batch_idx}.pt")
+    checkpoint_info_path = os.path.join(checkpoint_dir, f"checkpoint_epoch_{epoch}_batch_{batch_idx}.json")
+    
+    # Save model and optimizer state
+    torch.save({
+        'epoch': epoch,
+        'batch_idx': batch_idx,
+        'model_state_dict': student_model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'total_loss': total_loss,
+        'student_loss': student_loss,
+        'distill_loss': distill_loss,
+    }, checkpoint_path)
+    
+    # Save metadata as JSON for easy inspection
+    with open(checkpoint_info_path, 'w') as f:
+        json.dump({
+            'epoch': epoch,
+            'batch_idx': batch_idx,
+            'total_loss': float(total_loss),
+            'student_loss': float(student_loss),
+            'distill_loss': float(distill_loss),
+        }, f, indent=2)
+    
+    # Also save latest checkpoint
+    latest_path = os.path.join(checkpoint_dir, "latest_checkpoint.pt")
+    latest_info_path = os.path.join(checkpoint_dir, "latest_checkpoint.json")
+    torch.save({
+        'epoch': epoch,
+        'batch_idx': batch_idx,
+        'model_state_dict': student_model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'total_loss': total_loss,
+        'student_loss': student_loss,
+        'distill_loss': distill_loss,
+    }, latest_path)
+    
+    with open(latest_info_path, 'w') as f:
+        json.dump({
+            'epoch': epoch,
+            'batch_idx': batch_idx,
+            'total_loss': float(total_loss),
+            'student_loss': float(student_loss),
+            'distill_loss': float(distill_loss),
+        }, f, indent=2)
+    
+    print(f"Checkpoint saved: {checkpoint_path}")
+    return checkpoint_path
+
+
+def load_checkpoint(checkpoint_path, student_model, optimizer, device):
+    """Load a training checkpoint"""
+    print(f"Loading checkpoint from {checkpoint_path}...")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    student_model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    start_epoch = checkpoint['epoch']
+    start_batch = checkpoint.get('batch_idx', 0)
+    
+    print(f"Resumed from epoch {start_epoch}, batch {start_batch}")
+    print(f"  Total Loss: {checkpoint.get('total_loss', 'N/A'):.4f}")
+    print(f"  Student Loss: {checkpoint.get('student_loss', 'N/A'):.4f}")
+    print(f"  Distill Loss: {checkpoint.get('distill_loss', 'N/A'):.4f}")
+    
+    return start_epoch, start_batch
+
+
 # Training loop
 print("Starting training...")
 mask_token_id = teacher_tokenizer.mask_token_id
 
-# Create dataloader
-# Extract input_ids tensor from tokenized output
-if isinstance(tokenized_dataset, dict):
-    input_ids = tokenized_dataset["input_ids"]
-else:
-    # Handle BatchEncoding or other tokenizer output types
-    input_ids = tokenized_dataset["input_ids"] if hasattr(tokenized_dataset, "__getitem__") else tokenized_dataset.input_ids
+# Create DataLoader
+# tokenized_dataset is always StreamingTokenizedDataset (for both HuggingFace and local files)
+# Both modes now use streaming for efficiency - tokenizes on-the-fly, lower memory usage
+dataloader = DataLoader(
+    tokenized_dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=False,  # Can't shuffle streaming datasets (they're iterators)
+    pin_memory=True,
+    num_workers=0  # Set to 0 to avoid multiprocessing issues
+)
 
-# Ensure input_ids is a tensor
-if not isinstance(input_ids, torch.Tensor):
-    input_ids = torch.tensor(input_ids)
+# Resume from checkpoint if specified
+start_epoch = 0
+start_batch_idx = 0
+if RESUME_FROM_CHECKPOINT is not None and os.path.exists(RESUME_FROM_CHECKPOINT):
+    start_epoch, start_batch_idx = load_checkpoint(RESUME_FROM_CHECKPOINT, student_model, optimizer, DEVICE)
+elif RESUME_FROM_CHECKPOINT is None:
+    # Try to resume from latest checkpoint if it exists
+    latest_checkpoint = os.path.join(CHECKPOINT_DIR, "latest_checkpoint.pt")
+    if os.path.exists(latest_checkpoint):
+        print(f"Found latest checkpoint at {latest_checkpoint}")
+        response = input("Resume from latest checkpoint? (y/n): ").strip().lower()
+        if response == 'y':
+            start_epoch, start_batch_idx = load_checkpoint(latest_checkpoint, student_model, optimizer, DEVICE)
 
-num_batches = (len(input_ids) + BATCH_SIZE - 1) // BATCH_SIZE
-dataset_type = "dict"
-
-for epoch in range(NUM_EPOCHS):
+for epoch in range(start_epoch, NUM_EPOCHS):
     total_loss = 0
     total_student_loss = 0
     total_distill_loss = 0
     num_batches_processed = 0
     
-    batch_iter = range(num_batches)
+    batch_iter = tqdm(dataloader, desc=f"Epoch {epoch+1}")
+    # Skip batches if resuming from checkpoint (streaming datasets can't skip easily)
+    # Note: For streaming datasets, resuming from a specific batch is not supported
+    # as they are iterators without random access
+    if epoch == start_epoch and start_batch_idx > 0:
+        print(f"Warning: Resuming from batch {start_batch_idx} with streaming dataset.")
+        print("Streaming datasets don't support random access - will start from beginning of epoch.")
+        # For streaming, we can't skip batches efficiently, so we'll just continue from start
+        # In practice, you'd want to track samples processed rather than batches
     
-    for batch_idx in tqdm(batch_iter, desc=f"Epoch {epoch+1}"):
-        start_idx = batch_idx * BATCH_SIZE
-        end_idx = min(start_idx + BATCH_SIZE, len(input_ids))
-        batch_input_ids = input_ids[start_idx:end_idx].to(DEVICE)
+    for batch_idx, batch in enumerate(batch_iter):
+        # Adjust batch_idx if resuming (though streaming makes this approximate)
+        if epoch == start_epoch:
+            actual_batch_idx = start_batch_idx + batch_idx
+        else:
+            actual_batch_idx = batch_idx
+        
+        # Both HuggingFace and local files now use streaming - already tokenized in StreamingTokenizedDataset
+        batch_input_ids = batch["input_ids"].to(DEVICE)
         
         # Prepare input: use first part as prompt, rest will be masked
         prompt_len = batch_input_ids.shape[1] // 2  # Use half as prompt
@@ -368,6 +511,9 @@ for epoch in range(NUM_EPOCHS):
         
         # We should have 64 teacher logits (128 steps / 2)
         assert len(teacher_logits_list) == STUDENT_STEPS, f"Expected {STUDENT_STEPS} teacher logits, got {len(teacher_logits_list)}"
+        
+        # Get teacher final output for comparison
+        teacher_final_state = teacher_states_list[-1] if len(teacher_states_list) > 0 else None
         
         # Clear GPU cache after teacher forward pass
         torch.cuda.empty_cache()
@@ -444,6 +590,38 @@ for epoch in range(NUM_EPOCHS):
                 x_t_student[to_mask] = mask_token_id
                 keep_unmask = mask_index & (~to_mask)
                 x_t_student[keep_unmask] = x0_full[keep_unmask]
+            
+            # Print rollouts at specified steps
+            if PRINT_ROLLOUTS_EVERY_N_BATCHES > 0 and actual_batch_idx % PRINT_ROLLOUTS_EVERY_N_BATCHES == 0:
+                if step in PRINT_ROLLOUTS_AT_STEPS:
+                    # Get corresponding teacher step (step * 2 since teacher collects every 2 steps)
+                    teacher_step_idx = step
+                    if teacher_step_idx < len(teacher_states_list):
+                        teacher_state_at_step = teacher_states_list[teacher_step_idx]
+                        student_state_at_step = x_t_student
+                        
+                        # Decode and print
+                        teacher_tokens = teacher_state_at_step[0].cpu()  # First sample in batch
+                        student_tokens = student_state_at_step[0].cpu()
+                        
+                        # Remove padding tokens for cleaner output
+                        teacher_tokens = teacher_tokens[teacher_tokens != teacher_tokenizer.pad_token_id]
+                        student_tokens = student_tokens[student_tokens != student_tokenizer.pad_token_id]
+                        
+                        teacher_text = teacher_tokenizer.decode(teacher_tokens, skip_special_tokens=False)
+                        student_text = student_tokenizer.decode(student_tokens, skip_special_tokens=False)
+                        
+                        print(f"\n{'='*80}")
+                        print(f"Batch {actual_batch_idx}, Student Step {step}/{STUDENT_STEPS-1} (Teacher Step {step*2}/{TEACHER_STEPS-1})")
+                        print(f"{'='*80}")
+                        print(f"TEACHER (Step {step*2}):")
+                        print(f"{teacher_text[:500]}...")  # Limit to 500 chars
+                        print(f"\nSTUDENT (Step {step}):")
+                        print(f"{student_text[:500]}...")
+                        print(f"{'='*80}\n")
+        
+        # Get student final output for comparison
+        student_final_state = student_states_list[-1] if len(student_states_list) > 0 else None
         
         # ========== COMPUTE DISTILLATION LOSS ==========
         # Match student logit at step i to teacher logit at step 2*i
@@ -525,6 +703,52 @@ for epoch in range(NUM_EPOCHS):
         total_student_loss += student_loss_val
         total_distill_loss += distill_loss_val
         num_batches_processed += 1
+        
+        # Print final rollouts comparison
+        if PRINT_ROLLOUTS_EVERY_N_BATCHES > 0 and actual_batch_idx % PRINT_ROLLOUTS_EVERY_N_BATCHES == 0:
+            if teacher_final_state is not None and student_final_state is not None:
+                # Decode final outputs
+                teacher_final_tokens = teacher_final_state[0].cpu()
+                student_final_tokens = student_final_state[0].cpu()
+                
+                # Remove padding
+                teacher_final_tokens = teacher_final_tokens[teacher_final_tokens != teacher_tokenizer.pad_token_id]
+                student_final_tokens = student_final_tokens[student_final_tokens != student_tokenizer.pad_token_id]
+                
+                teacher_final_text = teacher_tokenizer.decode(teacher_final_tokens, skip_special_tokens=False)
+                student_final_text = student_tokenizer.decode(student_final_tokens, skip_special_tokens=False)
+                
+                print(f"\n{'='*80}")
+                print(f"FINAL OUTPUTS - Batch {actual_batch_idx}")
+                print(f"{'='*80}")
+                print(f"TEACHER FINAL (after {TEACHER_STEPS} steps):")
+                print(f"{teacher_final_text}")
+                print(f"\nSTUDENT FINAL (after {STUDENT_STEPS} steps):")
+                print(f"{student_final_text}")
+                print(f"\nLoss: Total={loss_val:.4f}, Student={student_loss_val:.4f}, Distill={distill_loss_val:.4f}")
+                print(f"{'='*80}\n")
+        
+        # Save checkpoint periodically
+        if SAVE_CHECKPOINT_EVERY_N_BATCHES > 0 and actual_batch_idx > 0 and actual_batch_idx % SAVE_CHECKPOINT_EVERY_N_BATCHES == 0:
+            avg_loss = total_loss / num_batches_processed
+            avg_student_loss = total_student_loss / num_batches_processed
+            avg_distill_loss = total_distill_loss / num_batches_processed
+            save_checkpoint(
+                student_model, optimizer, epoch, actual_batch_idx,
+                avg_loss, avg_student_loss, avg_distill_loss,
+                CHECKPOINT_DIR, student_tokenizer
+            )
+    
+    # Save checkpoint at end of epoch
+    if SAVE_CHECKPOINT_EVERY_EPOCH and num_batches_processed > 0:
+        avg_loss = total_loss / num_batches_processed
+        avg_student_loss = total_student_loss / num_batches_processed
+        avg_distill_loss = total_distill_loss / num_batches_processed
+        save_checkpoint(
+            student_model, optimizer, epoch, num_batches_processed - 1,
+            avg_loss, avg_student_loss, avg_distill_loss,
+            CHECKPOINT_DIR, student_tokenizer
+        )
     
     print(f"\nEpoch {epoch+1} Summary:")
     print(f"  Total Loss: {total_loss / num_batches_processed:.4f}")

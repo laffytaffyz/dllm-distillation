@@ -1,3 +1,4 @@
+models/
 sandbox/
 *.out
 *.err
@@ -186,3 +187,5 @@ eval/eval_infill/infill_results
 eval/eval_infill/infill_results/*
 
 data/
+
+logs/
