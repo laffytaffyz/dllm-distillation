@@ -52,6 +52,7 @@ STUDENT_MODEL_PATH = '/orcd/data/tpoggio/001/tiffany8/dllm-distillation/models/o
 TEACHER_MODEL = "fredzzp/open-dcoder-0.5B"  # HuggingFace model ID (used if TEACHER_MODEL_PATH is None)
 STUDENT_MODEL = "fredzzp/open-dcoder-0.5B"  # HuggingFace model ID (used if STUDENT_MODEL_PATH is None)
 BATCH_SIZE = 8
+GRADIENT_ACCUMULATION_STEPS = 2  # Accumulate gradients over N mini-batches (effective batch size = BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * num_gpus)
 
 # Use accelerator device
 DEVICE = accelerator.device 
@@ -185,9 +186,6 @@ class StreamingTokenizedDataset(IterableDataset):
 # Load dataset - using FineCode (same as Open-dLLM repo)
 print("Loading FineCode dataset (fredzzp/fine_code)...")
 print("Dataset size: ~95.7 GB (43.2M examples, 192 files)")
-print("To download locally, run:")
-print("  python3 scripts/download_hf_data.py --repo_id fredzzp/fine_code --local_dir ./data --max_workers 4")
-print()
 
 DATASET_NAME = "fredzzp/fine_code"
 USE_STREAMING = False  # Set to False to use local download (requires ~96GB free space)
@@ -490,16 +488,16 @@ start_epoch = 0
 start_batch_idx = 0
 if RESUME_FROM_CHECKPOINT is not None and os.path.exists(RESUME_FROM_CHECKPOINT):
     start_epoch, start_batch_idx = load_checkpoint(RESUME_FROM_CHECKPOINT, student_model, optimizer, DEVICE, accelerator)
-elif RESUME_FROM_CHECKPOINT is None:
-    # Try to resume from latest checkpoint if it exists
-    latest_checkpoint = os.path.join(CHECKPOINT_DIR, "latest_checkpoint.pt")
-    if os.path.exists(latest_checkpoint) and accelerator.is_main_process:
-        print(f"Found latest checkpoint at {latest_checkpoint}")
-        response = input("Resume from latest checkpoint? (y/n): ").strip().lower()
-        if response == 'y':
-            start_epoch, start_batch_idx = load_checkpoint(latest_checkpoint, student_model, optimizer, DEVICE, accelerator)
-    # Synchronize across all processes
-    accelerator.wait_for_everyone()
+# elif RESUME_FROM_CHECKPOINT is None:
+#     # Try to resume from latest checkpoint if it exists
+#     latest_checkpoint = os.path.join(CHECKPOINT_DIR, "latest_checkpoint.pt")
+#     if os.path.exists(latest_checkpoint) and accelerator.is_main_process:
+#         print(f"Found latest checkpoint at {latest_checkpoint}")
+#         response = input("Resume from latest checkpoint? (y/n): ").strip().lower()
+#         if response == 'y':
+#             start_epoch, start_batch_idx = load_checkpoint(latest_checkpoint, student_model, optimizer, DEVICE, accelerator)
+#     # Synchronize across all processes
+#     accelerator.wait_for_everyone()
 
 # Prepare models, optimizer, and dataloader with Accelerate
 # Note: teacher_model is not prepared since it's frozen and only used for inference
@@ -556,6 +554,10 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         # For streaming, we can't skip batches efficiently, so we'll just continue from start
         # In practice, you'd want to track samples processed rather than batches
     
+    # Initialize gradient accumulation counter
+    accumulation_step = 0
+    optimizer.zero_grad()  # Initialize gradients at start of epoch
+    
     for batch_idx, batch in enumerate(batch_iter):
         # Adjust batch_idx if resuming (though streaming makes this approximate)
         if epoch == start_epoch:
@@ -599,10 +601,13 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         student_states_list = []
         
         # Initialize student's x_t from teacher's first state (same starting point)
-        # Move back to GPU
+        # Move back to GPU (only when needed)
         x_t_student = teacher_states_list[0].to(DEVICE)
         fix_mask = (x_t_student != mask_token_id)
         attention_mask = (x_t_student != student_tokenizer.pad_token_id).long() if student_tokenizer.pad_token_id is not None else None
+        
+        # Note: teacher_states_list is kept on CPU for rollout printing later
+        # It will be deleted after rollout printing is complete
         
         eps = 1e-3
         timesteps_student = torch.linspace(1.0, eps, STUDENT_STEPS + 1, device=DEVICE)
@@ -622,16 +627,20 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             # Shift logits
             logits = torch.cat([logits[:, :1], logits[:, :-1]], dim=1)
             
-            # Collect logits at each step
-            student_logits_list.append(logits)
-            student_mask_positions_list.append(mask_index)
-            student_states_list.append(x_t_student.clone())
+            # Collect logits at each step (move to CPU to save GPU memory)
+            student_logits_list.append(logits.detach().cpu())
+            student_mask_positions_list.append(mask_index.cpu())
+            student_states_list.append(x_t_student.cpu().clone())
             
             # Update x_t using same algorithm as teacher
             if ALG == "p2":
                 kappa_t = (step + 1) / STUDENT_STEPS
                 
-                probs = F.softmax(logits / DIFFUSION_TEMP, dim=-1)
+                # Compute softmax in chunks to reduce memory usage
+                # Process logits in smaller chunks to avoid OOM
+                logits_scaled = logits / DIFFUSION_TEMP
+                # Use in-place operations where possible
+                probs = F.softmax(logits_scaled, dim=-1)
                 confidence = probs.max(dim=-1).values
                 x0_full = logits.argmax(dim=-1)
                 
@@ -698,15 +707,19 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         # Get student final output for comparison
         student_final_state = student_states_list[-1] if len(student_states_list) > 0 else None
         
+        # Now we can safely delete teacher_states_list (rollout printing is done)
+        # It was already on CPU, so this just frees CPU memory
+        del teacher_states_list
+        
         # ========== COMPUTE DISTILLATION LOSS ==========
         # Match student logit at step i to teacher logit at step 2*i
         distill_losses = []
         for i in range(min(len(student_logits_list), len(teacher_logits_list))):
-            student_logits = student_logits_list[i]
-            # Move teacher logits back to GPU for loss computation
+            # Move logits to GPU only when needed for loss computation
+            student_logits = student_logits_list[i].to(DEVICE)
             teacher_logits = teacher_logits_list[i].to(DEVICE)  # Teacher logit at step 2*i
             
-            student_mask = student_mask_positions_list[i]
+            student_mask = student_mask_positions_list[i].to(DEVICE)
             teacher_mask = teacher_mask_positions_list[i].to(DEVICE)
             
             # Only compute loss at masked positions
@@ -717,6 +730,9 @@ for epoch in range(start_epoch, NUM_EPOCHS):
             if student_mask_logits.numel() > 0 and teacher_mask_logits.numel() > 0:
                 # Ensure same number of masked positions (pad if needed)
                 min_masked = min(student_mask_logits.shape[0], teacher_mask_logits.shape[0])
+                
+                # Move logits back to CPU after loss computation to free GPU memory
+                # (We'll move them back when needed for loss computation)
                 if min_masked > 0:
                     student_log_probs = F.log_softmax(student_mask_logits[:min_masked] / TEMPERATURE, dim=-1)
                     teacher_probs = F.softmax(teacher_mask_logits[:min_masked] / TEMPERATURE, dim=-1)
@@ -729,6 +745,15 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                     ) * (TEMPERATURE ** 2)
                     
                     distill_losses.append(step_distill_loss)
+                    
+                    # Clear intermediate tensors from GPU
+                    del student_log_probs, teacher_probs, step_distill_loss
+            
+            # Clear logits from GPU after processing
+            del student_logits, teacher_logits, student_mask_logits, teacher_mask_logits, student_mask, teacher_mask
+        
+        # Clear cache once at end of loss computation loop (after all tensors are deleted)
+        torch.cuda.empty_cache()
         
         if distill_losses:
             distill_loss = torch.stack(distill_losses).mean()
@@ -758,10 +783,21 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         # Combined loss
         combined_loss = (1 - DISTILLATION_ALPHA) * student_loss + DISTILLATION_ALPHA * distill_loss
         
-        # Backward pass with Accelerate
-        optimizer.zero_grad()
-        accelerator.backward(combined_loss)
-        optimizer.step()
+        # Scale loss by gradient accumulation steps (Accelerate handles this automatically)
+        # This ensures the effective gradient is the same as if we used a larger batch size
+        scaled_loss = combined_loss / GRADIENT_ACCUMULATION_STEPS
+        
+        # Backward pass with Accelerate (accumulates gradients)
+        accelerator.backward(scaled_loss)
+        
+        # Increment accumulation counter
+        accumulation_step += 1
+        
+        # Only update weights and zero gradients after accumulating enough steps
+        if accumulation_step % GRADIENT_ACCUMULATION_STEPS == 0:
+            optimizer.step()
+            optimizer.zero_grad()
+            accumulation_step = 0
         
         # Store loss values before deleting tensors
         loss_val = combined_loss.item()
@@ -769,7 +805,8 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         distill_loss_val = distill_loss.item()
         
         # Clear GPU cache and delete intermediate tensors to free memory
-        del teacher_logits_list, teacher_mask_positions_list, teacher_states_list
+        # Note: teacher_states_list was already deleted earlier (after rollout printing)
+        del teacher_logits_list, teacher_mask_positions_list
         del student_logits_list, student_mask_positions_list, student_states_list
         del combined_loss, student_loss, distill_loss
         torch.cuda.empty_cache()
@@ -802,6 +839,12 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                 print(f"{student_final_text}")
                 print(f"\nLoss: Total={loss_val:.4f}, Student={student_loss_val:.4f}, Distill={distill_loss_val:.4f}")
                 print(f"{'='*80}\n")
+        
+        # Handle remaining accumulated gradients at end of batch loop (before checkpointing)
+        if accumulation_step > 0:
+            optimizer.step()
+            optimizer.zero_grad()
+            accumulation_step = 0
         
         # Save checkpoint periodically (only on main process)
         if SAVE_CHECKPOINT_EVERY_N_BATCHES > 0 and actual_batch_idx > 0 and actual_batch_idx % SAVE_CHECKPOINT_EVERY_N_BATCHES == 0:
