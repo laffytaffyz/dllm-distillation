@@ -1,9 +1,10 @@
 """
 Step-wise Diffusion Distillation Script for Open-dCoder
 
-Distills a teacher model (128 steps) to a student model (64 steps).
+Distills a teacher model (64 steps) to a student model (32 steps).
 Teacher logits are collected every 2 steps, and student learns to match them.
 
+This script continues distillation from a checkpoint (64→32 step distillation).
 Usage:
     python simple_distill_local_parallel.py
     or
@@ -63,21 +64,22 @@ TEMPERATURE = 4.0  # Temperature for softmax
 MAX_SEQ_LEN = 256  # Reduced for memory efficiency
 
 # Diffusion parameters
-TEACHER_STEPS = 128  # Teacher runs 128 steps
-STUDENT_STEPS = 64   # Student runs 64 steps
+TEACHER_STEPS = 64  # Teacher runs 64 steps
+STUDENT_STEPS = 32   # Student runs 32 steps
 COLLECT_EVERY_N = 2  # Collect teacher logits every 2 steps
 ALG = "p2"  # Sampling algorithm
 DIFFUSION_TEMP = 0.7  # Temperature for diffusion sampling
 TOP_K = 200
 
 # Dataset parameters
-MAX_SAMPLES = 100000
+# Set MAX_SAMPLES to match the number of samples in 1600 batches (same as previous distillation stage)
+MAX_SAMPLES = 1600 * BATCH_SIZE  # 1600 batches * batch_size
 
 # Checkpoint parameters
-CHECKPOINT_DIR = "./checkpoints"
+CHECKPOINT_DIR = "./checkpoints/64to32steps"
 SAVE_CHECKPOINT_EVERY_N_BATCHES = 200  # Save checkpoint every N batches (0 to disable)
 SAVE_CHECKPOINT_EVERY_EPOCH = True  # Save checkpoint at end of each epoch
-RESUME_FROM_CHECKPOINT = None  # Path to checkpoint to resume from, or None to start fresh
+RESUME_FROM_CHECKPOINT = "./checkpoints/latest_checkpoint_64_steps.pt"  # Path to checkpoint to resume from (64→32 distillation checkpoint)
 
 # Rollout printing parameters
 PRINT_ROLLOUTS_EVERY_N_BATCHES = 100  # Print teacher vs student rollouts every N batches (0 to disable)
@@ -146,16 +148,24 @@ optimizer = torch.optim.AdamW(student_model.parameters(), lr=LEARNING_RATE)
 # Create IterableDataset class for streaming mode
 class StreamingTokenizedDataset(IterableDataset):
     """Dataset that tokenizes on-the-fly for streaming mode"""
-    def __init__(self, dataset, tokenizer, max_length, max_samples=None):
+    def __init__(self, dataset, tokenizer, max_length, max_samples=None, skip_samples=0):
         self.dataset = dataset  # This is the streaming dataset iterator
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.max_samples = max_samples  # Limit number of samples
+        self.skip_samples = skip_samples  # Number of samples to skip before yielding
     
     def __iter__(self):
         """Iterate through streaming dataset and tokenize on-the-fly"""
+        samples_skipped = 0
         samples_yielded = 0
+        
         for sample in self.dataset:
+            # Skip samples if we haven't reached skip_samples yet
+            if samples_skipped < self.skip_samples:
+                samples_skipped += 1
+                continue
+            
             # Check if we've reached the limit
             if self.max_samples is not None and samples_yielded >= self.max_samples:
                 break
@@ -182,6 +192,31 @@ class StreamingTokenizedDataset(IterableDataset):
 # Streaming is faster and uses less memory for large datasets
 
 
+# Checkpoint loading function (defined early so it can be used before dataset creation)
+def load_checkpoint(checkpoint_path, student_model, optimizer, device, accelerator):
+    """Load a training checkpoint"""
+    if accelerator.is_main_process:
+        print(f"Loading checkpoint from {checkpoint_path}...")
+    
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # Load model state (will be wrapped by accelerator.prepare later if needed)
+    unwrapped_model = accelerator.unwrap_model(student_model) if hasattr(accelerator, 'unwrap_model') else student_model
+    unwrapped_model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    start_epoch = checkpoint['epoch']
+    start_batch = checkpoint.get('batch_idx', 0)
+    
+    if accelerator.is_main_process:
+        print(f"Resumed from epoch {start_epoch}, batch {start_batch}")
+        print(f"  Total Loss: {checkpoint.get('total_loss', 'N/A'):.4f}")
+        print(f"  Student Loss: {checkpoint.get('student_loss', 'N/A'):.4f}")
+        print(f"  Distill Loss: {checkpoint.get('distill_loss', 'N/A'):.4f}")
+    
+    return start_epoch, start_batch
+
+
 # DATASET LOADING --------------------
 # Load dataset - using FineCode (same as Open-dLLM repo)
 print("Loading FineCode dataset (fredzzp/fine_code)...")
@@ -190,6 +225,81 @@ print("Dataset size: ~95.7 GB (43.2M examples, 192 files)")
 DATASET_NAME = "fredzzp/fine_code"
 USE_STREAMING = False  # Set to False to use local download (requires ~96GB free space)
 LOCAL_DATA_DIR = "/orcd/data/tpoggio/001/tiffany8/dllm-distillation/data"  # Path to downloaded data
+
+# Skip samples will be calculated after checkpoint is loaded (if resuming)
+# This allows us to skip batches we've already seen
+SKIP_SAMPLES = 0  # Will be updated based on checkpoint
+
+# Load checkpoint early to determine SKIP_SAMPLES before creating dataset
+# This ensures we skip the correct number of samples when resuming
+start_epoch = 0
+start_batch_idx = 0
+if RESUME_FROM_CHECKPOINT is not None:
+    if RESUME_FROM_CHECKPOINT == "latest":
+        # Auto-resume from latest checkpoint if it exists
+        latest_checkpoint = os.path.join(CHECKPOINT_DIR, "latest_checkpoint.pt")
+        if os.path.exists(latest_checkpoint):
+            if accelerator.is_main_process:
+                print(f"Auto-resuming from latest checkpoint: {latest_checkpoint}")
+            start_epoch, start_batch_idx = load_checkpoint(latest_checkpoint, student_model, optimizer, DEVICE, accelerator)
+            
+            # For self-distillation continuation: copy checkpoint weights from student to teacher
+            if accelerator.is_main_process:
+                print("Copying checkpoint weights from student to teacher for self-distillation...")
+            try:
+                student_state_dict = student_model.state_dict()
+                teacher_state_dict = teacher_model.state_dict()
+                
+                copied = 0
+                for name, param in student_state_dict.items():
+                    if name in teacher_state_dict and param.shape == teacher_state_dict[name].shape:
+                        teacher_state_dict[name].data.copy_(param.data)
+                        copied += 1
+                
+                teacher_model.load_state_dict(teacher_state_dict, strict=False)
+                if accelerator.is_main_process:
+                    print(f"Copied {copied} parameters from checkpoint (student) to teacher")
+            except Exception as e:
+                if accelerator.is_main_process:
+                    print(f"Warning: Could not copy checkpoint weights to teacher: {e}")
+            
+            SKIP_SAMPLES = start_batch_idx * BATCH_SIZE
+            if accelerator.is_main_process:
+                print(f"Skipping first {SKIP_SAMPLES:,} samples (equivalent to {start_batch_idx} batches with batch_size={BATCH_SIZE})")
+        elif accelerator.is_main_process:
+            print("No latest checkpoint found, starting from scratch")
+    elif os.path.exists(RESUME_FROM_CHECKPOINT):
+        start_epoch, start_batch_idx = load_checkpoint(RESUME_FROM_CHECKPOINT, student_model, optimizer, DEVICE, accelerator)
+        
+        # For self-distillation continuation: copy checkpoint weights from student to teacher
+        # This ensures teacher uses the checkpoint model (64-step distilled model)
+        if accelerator.is_main_process:
+            print("Copying checkpoint weights from student to teacher for self-distillation...")
+        try:
+            student_state_dict = student_model.state_dict()
+            teacher_state_dict = teacher_model.state_dict()
+            
+            copied = 0
+            for name, param in student_state_dict.items():
+                if name in teacher_state_dict and param.shape == teacher_state_dict[name].shape:
+                    teacher_state_dict[name].data.copy_(param.data)
+                    copied += 1
+            
+            teacher_model.load_state_dict(teacher_state_dict, strict=False)
+            if accelerator.is_main_process:
+                print(f"Copied {copied} parameters from checkpoint (student) to teacher")
+        except Exception as e:
+            if accelerator.is_main_process:
+                print(f"Warning: Could not copy checkpoint weights to teacher: {e}")
+        
+        # Calculate number of samples to skip based on batches already seen
+        # This assumes each batch uses BATCH_SIZE samples (accounting for gradient accumulation separately)
+        # Note: In distributed training, each process sees a subset of data, but skip_samples should account for total samples seen
+        SKIP_SAMPLES = start_batch_idx * BATCH_SIZE
+        if accelerator.is_main_process:
+            print(f"Skipping first {SKIP_SAMPLES:,} samples (equivalent to {start_batch_idx} batches with batch_size={BATCH_SIZE})")
+    elif accelerator.is_main_process:
+        print(f"Warning: Checkpoint path {RESUME_FROM_CHECKPOINT} does not exist, starting from scratch")
 
 try:
     if USE_STREAMING:
@@ -204,7 +314,8 @@ try:
             dataset,
             teacher_tokenizer,
             MAX_SEQ_LEN,
-            max_samples=MAX_SAMPLES
+            max_samples=MAX_SAMPLES,
+            skip_samples=SKIP_SAMPLES
         )
         if accelerator.is_main_process:
             if MAX_SAMPLES is not None:
@@ -244,7 +355,8 @@ try:
             dataset,
             teacher_tokenizer,
             MAX_SEQ_LEN,
-            max_samples=MAX_SAMPLES
+            max_samples=MAX_SAMPLES,
+            skip_samples=SKIP_SAMPLES
         )
         if accelerator.is_main_process:
             if MAX_SAMPLES is not None:
@@ -448,30 +560,6 @@ def save_checkpoint(student_model, optimizer, epoch, batch_idx, total_loss, stud
     return checkpoint_path
 
 
-def load_checkpoint(checkpoint_path, student_model, optimizer, device, accelerator):
-    """Load a training checkpoint"""
-    if accelerator.is_main_process:
-        print(f"Loading checkpoint from {checkpoint_path}...")
-    
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    
-    # Load model state (will be wrapped by accelerator.prepare later if needed)
-    unwrapped_model = accelerator.unwrap_model(student_model) if hasattr(accelerator, 'unwrap_model') else student_model
-    unwrapped_model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    
-    start_epoch = checkpoint['epoch']
-    start_batch = checkpoint.get('batch_idx', 0)
-    
-    if accelerator.is_main_process:
-        print(f"Resumed from epoch {start_epoch}, batch {start_batch}")
-        print(f"  Total Loss: {checkpoint.get('total_loss', 'N/A'):.4f}")
-        print(f"  Student Loss: {checkpoint.get('student_loss', 'N/A'):.4f}")
-        print(f"  Distill Loss: {checkpoint.get('distill_loss', 'N/A'):.4f}")
-    
-    return start_epoch, start_batch
-
-
 # Create DataLoader (before prepare - will be prepared by accelerator)
 # tokenized_dataset is always StreamingTokenizedDataset (for both HuggingFace and local files)
 # Both modes now use streaming for efficiency - tokenizes on-the-fly, lower memory usage
@@ -482,12 +570,6 @@ dataloader = DataLoader(
     pin_memory=True,
     num_workers=0  # Set to 0 to avoid multiprocessing issues
 )
-
-# Resume from checkpoint if specified (before preparing with accelerator)
-start_epoch = 0
-start_batch_idx = 0
-if RESUME_FROM_CHECKPOINT is not None and os.path.exists(RESUME_FROM_CHECKPOINT):
-    start_epoch, start_batch_idx = load_checkpoint(RESUME_FROM_CHECKPOINT, student_model, optimizer, DEVICE, accelerator)
 # elif RESUME_FROM_CHECKPOINT is None:
 #     # Try to resume from latest checkpoint if it exists
 #     latest_checkpoint = os.path.join(CHECKPOINT_DIR, "latest_checkpoint.pt")
@@ -544,15 +626,10 @@ for epoch in range(start_epoch, NUM_EPOCHS):
     else:
         batch_iter = dataloader
     
-    # Skip batches if resuming from checkpoint (streaming datasets can't skip easily)
-    # Note: For streaming datasets, resuming from a specific batch is not supported
-    # as they are iterators without random access
-    if epoch == start_epoch and start_batch_idx > 0:
-        if accelerator.is_main_process:
-            print(f"Warning: Resuming from batch {start_batch_idx} with streaming dataset.")
-            print("Streaming datasets don't support random access - will start from beginning of epoch.")
-        # For streaming, we can't skip batches efficiently, so we'll just continue from start
-        # In practice, you'd want to track samples processed rather than batches
+    # Skip batches if resuming from checkpoint
+    # Note: We've already skipped samples in StreamingTokenizedDataset, so we just need to track batch_idx correctly
+    if epoch == start_epoch and start_batch_idx > 0 and accelerator.is_main_process:
+        print(f"Resuming training from batch {start_batch_idx} (skipped {SKIP_SAMPLES:,} samples in dataset)")
     
     # Initialize gradient accumulation counter
     accumulation_step = 0
@@ -572,7 +649,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         prompt_len = batch_input_ids.shape[1] // 2  # Use half as prompt
         prompt_ids = batch_input_ids[:, :prompt_len]
         
-        # ========== TEACHER: Run 128 steps, collect every 2 steps ==========
+        # ========== TEACHER: Run 64 steps, collect every 2 steps ==========
         with torch.no_grad():
             teacher_logits_list, teacher_mask_positions_list, teacher_states_list = run_diffusion_with_logit_collection(
                 model=teacher_model,
@@ -586,7 +663,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
                 top_k=TOP_K
             )
         
-        # We should have 64 teacher logits (128 steps / 2)
+        # We should have 32 teacher logits (64 steps / 2)
         assert len(teacher_logits_list) == STUDENT_STEPS, f"Expected {STUDENT_STEPS} teacher logits, got {len(teacher_logits_list)}"
         
         # Get teacher final output for comparison
@@ -595,7 +672,7 @@ for epoch in range(start_epoch, NUM_EPOCHS):
         # Clear GPU cache after teacher forward pass
         torch.cuda.empty_cache()
         
-        # ========== STUDENT: Run 64 steps, collect at each step ==========
+        # ========== STUDENT: Run 32 steps, collect at each step ==========
         student_logits_list = []
         student_mask_positions_list = []
         student_states_list = []
