@@ -47,6 +47,8 @@ class CustomCoder(LM):
         alg: Optional[str] = 'p2',
         alg_temp: Optional[float] = 0.5,
         trust_remote_code: Optional[bool] = True,
+        # Checkpoint loading (if pretrained is a .pt file)
+        base_model: Optional[str] = None,  # Base model path for loading checkpoints
         # Other lm-harness params
         max_length: Optional[int] = 2048,
         **kwargs,
@@ -59,6 +61,7 @@ class CustomCoder(LM):
         self.batch_size_per_gpu = int(batch_size)
         self.max_length = max_length
         self.trust_remote_code = trust_remote_code
+        self.base_model = base_model
 
         # Initialize parallel state for custom model
         self._init_parallel_state()
@@ -111,19 +114,77 @@ class CustomCoder(LM):
         )
 
     def _create_model_and_tokenizer(self, pretrained, dtype):
-        """Loads the Qwen2ForCausalLM model and its tokenizer."""
-        eval_logger.info(f"Loading tokenizer from: {pretrained}")
-        self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-            pretrained,
-            trust_remote_code=self.trust_remote_code,
-        )
+        """Loads the Qwen2ForCausalLM model and its tokenizer.
+        
+        Supports both HuggingFace model directories and PyTorch checkpoint files (.pt).
+        If pretrained is a .pt file, loads the base model first, then applies the checkpoint.
+        """
+        # Check if pretrained is a checkpoint file (.pt)
+        is_checkpoint = isinstance(pretrained, str) and pretrained.endswith('.pt') and os.path.isfile(pretrained)
+        
+        if is_checkpoint:
+            # Load from checkpoint file
+            eval_logger.info(f"Detected checkpoint file: {pretrained}")
+            
+            # Determine base model path
+            if self.base_model:
+                base_model_path = self.base_model
+            else:
+                # Default base model path (same as used in training)
+                base_model_path = '/orcd/data/tpoggio/001/tiffany8/dllm-distillation/models/open-dcoder-0.5B'
+                if not os.path.exists(base_model_path):
+                    # Fallback to HuggingFace model ID
+                    base_model_path = "fredzzp/open-dcoder-0.5B"
+            
+            eval_logger.info(f"Loading base model from: {base_model_path}")
+            eval_logger.info(f"Loading tokenizer from base model: {base_model_path}")
+            self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+                base_model_path,
+                trust_remote_code=self.trust_remote_code,
+            )
+            
+            eval_logger.info(f"Loading base model: {base_model_path}")
+            self.model = Qwen2ForCausalLM.from_pretrained(
+                base_model_path,
+                torch_dtype=get_dtype(dtype),
+                trust_remote_code=self.trust_remote_code,
+            )
+            
+            # Load checkpoint state dict
+            eval_logger.info(f"Loading checkpoint weights from: {pretrained}")
+            checkpoint = torch.load(pretrained, map_location="cpu")
+            
+            # Handle both 'model_state_dict' (from training checkpoints) and direct state dict
+            if 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+                eval_logger.info(f"Checkpoint info: epoch={checkpoint.get('epoch', 'N/A')}, "
+                               f"batch={checkpoint.get('batch_idx', 'N/A')}, "
+                               f"loss={checkpoint.get('total_loss', 'N/A'):.4f}")
+            else:
+                state_dict = checkpoint
+            
+            # Load state dict directly (model is not wrapped yet at this point)
+            missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
+            if missing_keys:
+                eval_logger.warning(f"Missing keys when loading checkpoint: {len(missing_keys)} keys")
+            if unexpected_keys:
+                eval_logger.warning(f"Unexpected keys when loading checkpoint: {len(unexpected_keys)} keys")
+            
+            eval_logger.info("✓ Checkpoint loaded successfully")
+        else:
+            # Load from HuggingFace model directory or model ID
+            eval_logger.info(f"Loading tokenizer from: {pretrained}")
+            self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+                pretrained,
+                trust_remote_code=self.trust_remote_code,
+            )
 
-        eval_logger.info(f"Loading model from: {pretrained}")
-        self.model = Qwen2ForCausalLM.from_pretrained(
-            pretrained,
-            torch_dtype=get_dtype(dtype),
-            trust_remote_code=self.trust_remote_code,
-        )
+            eval_logger.info(f"Loading model from: {pretrained}")
+            self.model = Qwen2ForCausalLM.from_pretrained(
+                pretrained,
+                torch_dtype=get_dtype(dtype),
+                trust_remote_code=self.trust_remote_code,
+            )
 
         # Set the mask token if not already set. This is crucial for
         # generation.
