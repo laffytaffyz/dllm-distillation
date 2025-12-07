@@ -41,6 +41,7 @@ bash run_eval.sh
 - `--tasks`: Available tasks: `humaneval`, `humaneval_plus`, `mbpp`, `mbpp_plus`
 - `--num_fewshot`: Number of few-shot examples (typically 0 for code generation)
 - `--batch_size`: Batch size for evaluation
+- `--model`: Type of model (`custom_coder` or `autoregressive_qwen`)
 
 ## Evaluation & Grading
 
@@ -49,12 +50,12 @@ The system uses LM-Eval-Harness built-in evaluation for code generation tasks:
 
 #### HumanEval (`humaneval`, `humaneval_plus`)
 - **Method**: Functional correctness testing
-- **Metrics**: `pass@k` scores
+- **Metrics**: `pass@k` scores, average inference time across 10 fixed samples after warmup
 - **Process**: Executes generated code against test cases
 
 #### MBPP (`mbpp`, `mbpp_plus`) 
 - **Method**: Functional correctness testing
-- **Metrics**: `pass@k` scores
+- **Metrics**: `pass@k` scores, average inference time across 10 fixed samples after warmup
 - **Process**: Executes generated code against test cases
 
 ### Output Files
