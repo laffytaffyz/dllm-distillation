@@ -877,6 +877,13 @@ if __name__ == "__main__":
     import sys
     from eval_utils import upload_results_after_eval
 
+    # Set default model to custom_coder if not specified
+    if '--model' not in sys.argv:
+        # Insert --model custom_coder after the script name
+        sys.argv.insert(1, 'custom_coder')
+        sys.argv.insert(1, '--model')
+        eval_logger.info("No --model specified, defaulting to 'custom_coder'")
+
     # Remove wandb_project_name from sys.argv before calling cli_evaluate
     # since lm-harness doesn't recognize this argument
     wandb_project_name = None
