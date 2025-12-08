@@ -366,10 +366,9 @@ class CustomCoder(LM):
         """
         res = []
         
-        # Track inference time for first few samples
+        # Track inference time for all samples
         inference_times = []
-        num_inference_samples = min(10, len(requests))
-        measure_inference = self.accelerator.is_main_process and num_inference_samples > 0
+        measure_inference = self.accelerator.is_main_process and len(requests) > 0
 
         # Only show progress bar on main process
         disable_tqdm = disable_tqdm or not self.accelerator.is_main_process
@@ -387,9 +386,9 @@ class CustomCoder(LM):
             first_req_args = batch_requests[0].args
             gen_kwargs = first_req_args[1] if len(first_req_args) > 1 else {}
 
-            # Measure inference time for first few samples
-            if measure_inference and i < num_inference_samples:
-                # Warmup
+            # Measure inference time for all samples
+            if measure_inference:
+                # Warmup on first batch
                 if i == 0:
                     _ = self._generate_batch([contexts[0]], gen_kwargs)
                     if torch.cuda.is_available():
@@ -445,12 +444,9 @@ class CustomCoder(LM):
                 else self.model
             )
             
-            # Sample a subset of prompts for perplexity (to avoid being too slow)
-            num_ppl_samples = min(50, len(requests))
-            sample_indices = torch.linspace(0, len(requests) - 1, num_ppl_samples, device='cpu').long().tolist()
-            
+            # Calculate perplexity on all prompts
             with torch.no_grad():
-                for idx in sample_indices:
+                for idx in range(len(requests)):
                     context = requests[idx].args[0]
                     
                     # Tokenize prompt
@@ -916,10 +912,9 @@ class AutoregressiveQwen(LM):
         """
         res = []
         
-        # Track inference time for first few samples
+        # Track inference time for all samples
         inference_times = []
-        num_inference_samples = min(10, len(requests))
-        measure_inference = self.accelerator.is_main_process and num_inference_samples > 0
+        measure_inference = self.accelerator.is_main_process and len(requests) > 0
 
         # Only show progress bar on main process
         disable_tqdm = disable_tqdm or not self.accelerator.is_main_process
@@ -937,9 +932,9 @@ class AutoregressiveQwen(LM):
             first_req_args = batch_requests[0].args
             gen_kwargs = first_req_args[1] if len(first_req_args) > 1 else {}
 
-            # Measure inference time for first few samples
-            if measure_inference and i < num_inference_samples:
-                # Warmup
+            # Measure inference time for all samples
+            if measure_inference:
+                # Warmup on first batch
                 if i == 0:
                     _ = self._generate_batch([contexts[0]], gen_kwargs)
                     if torch.cuda.is_available():
@@ -995,12 +990,9 @@ class AutoregressiveQwen(LM):
                 else self.model
             )
             
-            # Sample a subset of prompts for perplexity (to avoid being too slow)
-            num_ppl_samples = min(50, len(requests))
-            sample_indices = torch.linspace(0, len(requests) - 1, num_ppl_samples, device='cpu').long().tolist()
-            
+            # Calculate perplexity on all prompts
             with torch.no_grad():
-                for idx in sample_indices:
+                for idx in range(len(requests)):
                     context = requests[idx].args[0]
                     
                     # Tokenize prompt
