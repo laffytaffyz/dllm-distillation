@@ -13,29 +13,21 @@ import argparse
 import os
 import subprocess
 import sys
-import random
-import json
-
-def get_random_samples(dataset_size=164, num_samples=164, seed=42):
-    """Get random sample indices with a fixed seed."""
-    random.seed(seed)
-    sample_indices = random.sample(range(dataset_size), min(num_samples, dataset_size))
-    sample_indices.sort()
-    return sample_indices
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate distilled diffusion model")
     parser.add_argument(
-        "--model_path",
+        "model_path",
+        nargs="?",
         type=str,
-        default="./distilled_student_model",
-        help="Path to distilled model directory (default: ./distilled_student_model)"
+        default="fredzzp/open-dcoder-0.5B",
+        help="Path to distilled model directory (default: fredzzp/open-dcoder-0.5B)"
     )
     parser.add_argument(
         "--steps",
         type=int,
-        default=64,
-        help="Number of diffusion steps (default: 64, matching student training)"
+        default=16,
+        help="Number of diffusion steps (default: 16, matching student training)"
     )
     parser.add_argument(
         "--temperature",
@@ -58,8 +50,8 @@ def main():
     parser.add_argument(
         "--num_processes",
         type=int,
-        default=4,
-        help="Number of processes for accelerate (default: 4)"
+        default=8,
+        help="Number of processes for accelerate (default: 8)"
     )
     parser.add_argument(
         "--batch_size",
@@ -71,8 +63,9 @@ def main():
         "--tasks",
         type=str,
         nargs="+",
-        default=["humaneval", "humaneval_plus", "mbpp", "mbpp_plus"],
-        help="Tasks to evaluate (default: all)"
+        # default=["humaneval_iris", "humaneval_plus_iris", "mbpp_iris", "mbpp_plus_iris"],
+        default=["mbpp_iris", "mbpp_plus_iris"],
+        help="Tasks to evaluate (default: all generation tasks; perplexity is computed on prompts automatically)"
     )
     parser.add_argument(
         "--cuda_devices",
@@ -108,7 +101,7 @@ def main():
     # Get absolute path to eval_iris.py (uses fixed diffusion perplexity)
     eval_dir = os.path.join(script_dir, "..", "eval", "eval_completion")
     eval_dir = os.path.abspath(eval_dir)  # Resolve .. in path
-    eval_script = os.path.join(eval_dir, "eval_iris_chat.py")
+    eval_script = os.path.join(eval_dir, "eval_iris.py")
     
     if not os.path.exists(eval_script):
         print(f"Error: Could not find eval script at {eval_script}")
@@ -164,15 +157,7 @@ def main():
             "--confirm_run_unsafe_code"
         ]
         
-        # For humaneval and humaneval_plus, use random subset of 164 samples (full dataset) with fixed seeds
-        if task in ["humaneval", "humaneval_plus"]:
-            # Use different seeds for humaneval and humaneval_plus to get different subsets
-            seed = 42 if task == "humaneval" else 123
-            sample_indices = get_random_samples(dataset_size=164, num_samples=164, seed=seed)
-            samples_json = json.dumps(sample_indices)
-            cmd.extend(["--samples", samples_json])
-            print(f"Using random subset of {len(sample_indices)} samples (seed={seed})")
-        
+        # Use full dataset for all tasks (no sampling)
         print(f"Command: {' '.join(cmd)}")
         print()
         

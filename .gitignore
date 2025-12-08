@@ -186,6 +186,7 @@ eval/lm_eval_harness/evals_results_test
 eval/lm_eval_harness/evals_results_test_aug26
 eval/eval_infill/infill_results
 eval/eval_infill/infill_results/*
+eval/eval_completion/evals_results/
 
 data/
 

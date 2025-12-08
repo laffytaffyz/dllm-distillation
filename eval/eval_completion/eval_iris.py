@@ -4,6 +4,7 @@ import json
 import glob
 import re
 import time
+import math
 from typing import List, Optional, Union
 
 import torch
@@ -422,6 +423,19 @@ class CustomCoder(LM):
             avg_time = sum(inference_times) / len(inference_times)
             eval_logger.info(f"[diffusion] Average inference time: {avg_time:.4f} seconds per prompt (group size n preserved)")
             print(f"\n[diffusion] Average inference time: {avg_time:.4f} seconds per prompt (group size n preserved)")
+
+        # Compute perplexity on prompts (only on main process to avoid duplicate computation)
+        if self.accelerator.is_main_process:
+            ppl_list = []
+            for req in requests:
+                ppl = self._compute_diffusion_perplexity(req.args[0])
+                if ppl is not None and not math.isnan(ppl):
+                    ppl_list.append(ppl)
+            
+            if ppl_list:
+                avg_ppl = sum(ppl_list) / len(ppl_list)
+                eval_logger.info(f"[Diffusion PPL] Average perplexity: {avg_ppl:.4f} over {len(ppl_list)} prompts")
+                print(f"\n[Diffusion PPL] Average perplexity: {avg_ppl:.4f} over {len(ppl_list)} prompts")
 
         # FINAL CLEANUP – required for HumanEval
         cleaned_results = []
