@@ -63,8 +63,7 @@ def main():
         "--tasks",
         type=str,
         nargs="+",
-        # default=["humaneval_iris", "humaneval_plus_iris", "mbpp_iris", "mbpp_plus_iris"],
-        default=["mbpp_iris", "mbpp_plus_iris"],
+        default=["humaneval_iris", "humaneval_plus_iris", "mbpp_iris", "mbpp_plus_iris"],
         help="Tasks to evaluate (default: all generation tasks; perplexity is computed on prompts automatically)"
     )
     parser.add_argument(
