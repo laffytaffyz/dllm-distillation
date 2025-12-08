@@ -4,6 +4,8 @@ import glob
 import re
 import sys
 import wandb
+import torch
+import torch.nn.functional as F
 
 
 def flatten_metrics(results_dict):
@@ -181,3 +183,85 @@ def extract_config_from_args():
                 config[key] = value
 
     return config
+
+
+def calculate_log_likelihood_from_logits(
+    logits: torch.Tensor,
+    target_ids: torch.Tensor,
+    ignore_index: int = -100
+) -> tuple[float, int]:
+    """
+    Calculate log-likelihood from model logits and target token IDs.
+    
+    Args:
+        logits: Model logits [batch, seq_len, vocab_size] or [seq_len, vocab_size]
+        target_ids: Target token IDs [batch, seq_len] or [seq_len]
+        ignore_index: Token ID to ignore in loss calculation
+        
+    Returns:
+        Tuple of (total_log_likelihood, num_valid_tokens)
+    """
+    # Handle single sequence case
+    if logits.dim() == 2:
+        logits = logits.unsqueeze(0)
+        target_ids = target_ids.unsqueeze(0)
+    
+    # Flatten for loss calculation
+    logits_flat = logits.view(-1, logits.size(-1))
+    targets_flat = target_ids.view(-1)
+    
+    # Calculate log probabilities
+    log_probs = F.log_softmax(logits_flat, dim=-1)
+    
+    # Get log probability of target tokens
+    target_log_probs = log_probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
+    
+    # Mask out ignored tokens
+    mask = (targets_flat != ignore_index)
+    valid_log_probs = target_log_probs * mask.float()
+    
+    # Sum log probabilities (equivalent to product of probabilities in log space)
+    total_log_likelihood = valid_log_probs.sum().item()
+    num_valid_tokens = mask.sum().item()
+    
+    return total_log_likelihood, num_valid_tokens
+
+
+def get_rolling_token_windows(
+    token_list: list[int],
+    prefix_token: int,
+    max_seq_len: int,
+    context_len: int = 1
+) -> list[tuple[list[int], list[int]]]:
+    """
+    Generate rolling token windows for loglikelihood_rolling.
+    
+    Args:
+        token_list: List of token IDs
+        prefix_token: Prefix token ID (e.g., BOS/EOS)
+        max_seq_len: Maximum sequence length
+        context_len: Context length for rolling window
+        
+    Returns:
+        List of (context, continuation) tuples
+    """
+    windows = []
+    
+    # Add prefix token
+    tokens_with_prefix = [prefix_token] + token_list
+    
+    # Generate rolling windows
+    for i in range(len(tokens_with_prefix)):
+        # Context is everything up to position i
+        context = tokens_with_prefix[:i+1]
+        
+        # Continuation is the next tokens up to max_seq_len
+        continuation_start = i + 1
+        continuation_end = min(continuation_start + max_seq_len - len(context), len(tokens_with_prefix))
+        
+        if continuation_start < len(tokens_with_prefix):
+            continuation = tokens_with_prefix[continuation_start:continuation_end]
+            if len(continuation) > 0:
+                windows.append((context, continuation))
+    
+    return windows

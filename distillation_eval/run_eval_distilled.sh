@@ -4,11 +4,19 @@
 # This script evaluates a model distilled using simple_distill.py
 
 # Model configuration
-MODEL_PATH_ARG="${1:-./distilled_student_model}"  # Default to distilled_student_model, or pass as first arg
+# Default to checkpoint path, or pass as first arg
+# Supports both HuggingFace model directories and .pt checkpoint files
+# MODEL_PATH_ARG="${1:-/orcd/data/tpoggio/001/tiffany8/dllm-distillation/checkpoints/latest_checkpoint_64_steps.pt}"
+# MODEL_PATH_ARG="${1:-/orcd/data/tpoggio/001/tiffany8/dllm-distillation/models/open-dcoder-0.5B}"
+# MODEL_PATH_ARG="${1:-/orcd/data/tpoggio/001/tiffany8/dllm-distillation/models/qwen2-0.5B}"
+# MODEL_PATH_ARG="${1:-/orcd/data/tpoggio/001/tiffany8/dllm-distillation/checkpoints/64to32steps/latest_checkpoint.pt}"
+MODEL_PATH_ARG="${1:-/orcd/data/tpoggio/001/tiffany8/dllm-distillation/checkpoints/32to16steps/latest_checkpoint_16_steps.pt}"
 MAX_NEW_TOKENS=128
-STEPS=64  # Student was trained with 64 steps (half of teacher's 128)
+STEPS=16  # Student was trained with 16 steps (half of teacher's 32)
 TEMPERATURE=0.8
 ALG="p2"  # Same algorithm used during distillation
+# TOP_P=0.95
+# DO_SAMPLE=true
 NUM_PROCESSES=4
 
 # Get script directory for finding eval directory
@@ -33,21 +41,23 @@ fi
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export HF_ALLOW_CODE_EVAL=1
 
-# Check if model path exists
-if [ ! -d "$MODEL_PATH" ]; then
+# Check if model path exists (either directory for HuggingFace models or .pt file for checkpoints)
+if [ ! -d "$MODEL_PATH" ] && [ ! -f "$MODEL_PATH" ]; then
     echo "Error: Model path '$MODEL_PATH' does not exist!"
     echo "Usage: $0 [model_path]"
-    echo "Example: $0 ./distilled_student_model"
+    echo "  - HuggingFace model directory: $0 ./distilled_student_model"
+    echo "  - Checkpoint file: $0 ./checkpoints/latest_checkpoint_64_steps.pt"
     exit 1
 fi
 
 echo "=========================================="
-echo "Evaluating Distilled Model"
+echo "Evaluating Autoregressive Model"
 echo "=========================================="
 echo "Model Path: $MODEL_PATH"
-echo "Steps: $STEPS"
-echo "Algorithm: $ALG"
+echo "Max New Tokens: $MAX_NEW_TOKENS"
 echo "Temperature: $TEMPERATURE"
+echo "Top-p: $TOP_P"
+echo "Do Sample: $DO_SAMPLE"
 echo "=========================================="
 
 # Change to eval directory
@@ -61,8 +71,8 @@ mkdir -p "$RESULTS_DIR"
 echo ""
 echo "Running HumanEval evaluation..."
 accelerate launch --num_processes $NUM_PROCESSES eval.py \
-    --model custom_coder \
-    --model_args "pretrained=$MODEL_PATH,max_new_tokens=$MAX_NEW_TOKENS,steps=$STEPS,add_bos_token=true,temperature=$TEMPERATURE,top_p=0.95,alg=$ALG" \
+    --model autoregressive_qwen \
+    --model_args "pretrained=$MODEL_PATH,max_new_tokens=$MAX_NEW_TOKENS,temperature=$TEMPERATURE,top_p=$TOP_P,do_sample=$DO_SAMPLE" \
     --tasks humaneval \
     --num_fewshot 0 \
     --batch_size 10 \
@@ -74,8 +84,8 @@ accelerate launch --num_processes $NUM_PROCESSES eval.py \
 echo ""
 echo "Running HumanEval Plus evaluation..."
 accelerate launch --num_processes $NUM_PROCESSES eval.py \
-    --model custom_coder \
-    --model_args "pretrained=$MODEL_PATH,max_new_tokens=$MAX_NEW_TOKENS,steps=$STEPS,add_bos_token=true,temperature=$TEMPERATURE,top_p=0.95,alg=$ALG" \
+    --model autoregressive_qwen \
+    --model_args "pretrained=$MODEL_PATH,max_new_tokens=$MAX_NEW_TOKENS,temperature=$TEMPERATURE,top_p=$TOP_P,do_sample=$DO_SAMPLE" \
     --tasks humaneval_plus \
     --num_fewshot 0 \
     --batch_size 10 \
@@ -87,8 +97,8 @@ accelerate launch --num_processes $NUM_PROCESSES eval.py \
 echo ""
 echo "Running MBPP evaluation..."
 accelerate launch --num_processes $NUM_PROCESSES eval.py \
-    --model custom_coder \
-    --model_args "pretrained=$MODEL_PATH,max_new_tokens=$MAX_NEW_TOKENS,steps=$STEPS,add_bos_token=true,temperature=$TEMPERATURE,top_p=0.95,alg=$ALG" \
+    --model autoregressive_qwen \
+    --model_args "pretrained=$MODEL_PATH,max_new_tokens=$MAX_NEW_TOKENS,temperature=$TEMPERATURE,top_p=$TOP_P,do_sample=$DO_SAMPLE" \
     --tasks mbpp \
     --num_fewshot 0 \
     --batch_size 10 \
@@ -100,8 +110,8 @@ accelerate launch --num_processes $NUM_PROCESSES eval.py \
 echo ""
 echo "Running MBPP Plus evaluation..."
 accelerate launch --num_processes $NUM_PROCESSES eval.py \
-    --model custom_coder \
-    --model_args "pretrained=$MODEL_PATH,max_new_tokens=$MAX_NEW_TOKENS,steps=$STEPS,add_bos_token=true,temperature=$TEMPERATURE,top_p=0.95,alg=$ALG" \
+    --model autoregressive_qwen \
+    --model_args "pretrained=$MODEL_PATH,max_new_tokens=$MAX_NEW_TOKENS,temperature=$TEMPERATURE,top_p=$TOP_P,do_sample=$DO_SAMPLE" \
     --tasks mbpp_plus \
     --num_fewshot 0 \
     --batch_size 10 \
