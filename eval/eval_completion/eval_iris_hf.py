@@ -250,6 +250,107 @@ class CustomCoder(LM):
 
         return grouped
 
+    # -------------------------
+    # Diffusion perplexity
+    # -------------------------
+    def _compute_diffusion_perplexity(self, text: str) -> Optional[float]:
+        """
+        Progressive-denoising perplexity for discrete DLMs.
+
+        Spec: NLL is computed *only* on tokens newly unmasked at each step, summed over steps, then divided by L.
+              PPL = exp( NLL )
+
+        Implementation details:
+          - Reveal schedule chosen by *confidence from log-probs* (temperature-free)
+          - Teacher-force revealed content with ground-truth x0
+          - Last step reveals all remaining tokens to ensure each position is scored exactly once
+        """
+        import math
+        import torch.nn.functional as F
+
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        device = self.device
+
+        # Tokenize ground truth properly (encode() doesn't support return_tensors)
+        enc = self.tokenizer(
+            text, add_special_tokens=False, return_tensors="pt"
+        )
+        x0 = enc.input_ids.to(device)  # [1, L]
+        B, L = x0.shape
+        if L == 0:
+            return float("nan")
+
+        mask_id = self.tokenizer.mask_token_id
+        if mask_id is None:
+            raise ValueError("Tokenizer must define mask_token_id before computing diffusion perplexity.")
+
+        # Start fully masked
+        x_t = torch.full_like(x0, mask_id)
+        masked = torch.ones_like(x0, dtype=torch.bool)  # True if currently masked
+
+        nll_terms = []
+
+        with torch.no_grad():
+            for step in range(self.steps):
+                # Forward (disable causal masking; diffusion uses full context)
+                try:
+                    out = model(input_ids=x_t, is_causal=False)
+                except TypeError:
+                    out = model(input_ids=x_t)
+                logits = out.logits  # [B, L, V]
+                log_probs = F.log_softmax(logits, dim=-1)
+
+                # Confidence for schedule selection (no temp; use log-prob for stability)
+                conf, _ = log_probs.max(dim=-1)  # [B, L]
+
+                # Target number of unmasked positions by step
+                # Use ceil & clamp, and make last step reveal all remaining
+                kappa = (step + 1) / self.steps
+                target_unmasked = torch.clamp(
+                    torch.ceil(torch.tensor(kappa * L, device=device)), min=1, max=L
+                ).long()  # scalar (apply per-b with same target)
+
+                current_unmasked = (~masked).sum(dim=1)  # [B]
+                # On the final step, force full reveal
+                if step == self.steps - 1:
+                    target_unmasked = torch.full_like(target_unmasked, L)
+
+                num_new = (target_unmasked - current_unmasked).clamp(min=0)  # [B]
+                if num_new.max().item() == 0:
+                    continue
+
+                newly = torch.zeros_like(masked)  # [B, L] bool
+
+                # select new positions independently per sample
+                for b in range(B):
+                    k = num_new[b].item()
+                    if k <= 0:
+                        continue
+                    conf_masked = conf[b].clone()
+                    conf_masked[~masked[b]] = -float("inf")  # exclude already revealed
+                    topk = conf_masked.topk(k, dim=-1).indices
+                    newly[b, topk] = True
+
+                # NLL over newly revealed positions
+                # log p(x0_i | x_t, t) at the ground-truth ids
+                log_p_all = log_probs.gather(2, x0.unsqueeze(-1)).squeeze(-1)  # [B, L]
+                nll_step = -log_p_all[newly]
+                if nll_step.numel() > 0:
+                    nll_terms.append(nll_step)
+
+                # Teacher-force: insert ground truth at revealed positions
+                x_t = x_t.clone()
+                masked = masked.clone()
+                x_t[newly] = x0[newly]
+                masked[newly] = False
+
+        if not nll_terms:
+            return float("nan")
+
+        total_nll = torch.cat(nll_terms, dim=0).sum()  # scalar
+        NLL = total_nll / L  # divided by sequence length L (spec)
+        PPL = math.exp(NLL.item())
+        return PPL
 
     # -------------------------
     # lm-harness interfaces
@@ -323,7 +424,10 @@ class CustomCoder(LM):
             eval_logger.info(f"[diffusion] Average inference time: {avg_time:.4f} seconds per prompt (group size n preserved)")
             print(f"\n[diffusion] Average inference time: {avg_time:.4f} seconds per prompt (group size n preserved)")
 
+        #     results_dir = os.path.join(eval_dir, "evals_results", f"baseline-{model_name}-{args.steps}")
 
+
+        
         # FINAL CLEANUP – required for HumanEval
         cleaned_results = []
         for cand_list in results:

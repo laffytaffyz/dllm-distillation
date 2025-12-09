@@ -97,7 +97,6 @@ def main():
     
     os.environ["HF_ALLOW_CODE_EVAL"] = "1"
     
-    # Get absolute path to eval_iris.py (uses fixed diffusion perplexity)
     eval_dir = os.path.join(script_dir, "..", "eval", "eval_completion")
     eval_dir = os.path.abspath(eval_dir)  # Resolve .. in path
     eval_script = os.path.join(eval_dir, "eval_iris.py")
