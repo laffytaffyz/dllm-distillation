@@ -79,8 +79,7 @@ for task_name in task_names:
     total_tokens = 0
     print(f"TASK NAME: {task_name} \n")
 
-    # for i in range(0, len(texts), batch_size):
-    for i in range(0, 10, batch_size):
+    for i in range(0, len(texts), batch_size):
         batch = texts[i : i + batch_size]
         res = lm.compute_perplexity(batch, return_stats=True)
         if res is None:
