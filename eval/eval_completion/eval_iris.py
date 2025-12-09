@@ -424,18 +424,6 @@ class CustomCoder(LM):
             eval_logger.info(f"[diffusion] Average inference time: {avg_time:.4f} seconds per prompt (group size n preserved)")
             print(f"\n[diffusion] Average inference time: {avg_time:.4f} seconds per prompt (group size n preserved)")
 
-        # Compute perplexity on prompts (only on main process to avoid duplicate computation)
-        if self.accelerator.is_main_process:
-            ppl_list = []
-            for req in requests:
-                ppl = self._compute_diffusion_perplexity(req.args[0])
-                if ppl is not None and not math.isnan(ppl):
-                    ppl_list.append(ppl)
-            
-            if ppl_list:
-                avg_ppl = sum(ppl_list) / len(ppl_list)
-                eval_logger.info(f"[Diffusion PPL] Average perplexity: {avg_ppl:.4f} over {len(ppl_list)} prompts")
-                print(f"\n[Diffusion PPL] Average perplexity: {avg_ppl:.4f} over {len(ppl_list)} prompts")
 
         # FINAL CLEANUP – required for HumanEval
         cleaned_results = []
@@ -469,12 +457,7 @@ class CustomCoder(LM):
         raise NotImplementedError("Progressive denoising models do not support AR loglikelihood.")
 
     def loglikelihood_rolling(self, requests: List[Instance]) -> List[float]:
-        vals = []
-        for req in requests:
-            ppl = self._compute_diffusion_perplexity(req.args[0])
-            print(f"[Diffusion PPL] {ppl}")
-            vals.append(float("nan") if ppl is None else float(ppl))
-        return vals
+        raise NotImplementedError("Progressive denoising models do not support AR loglikelihood.")
 
     # -------------------------
     # helpers / properties
@@ -526,28 +509,6 @@ class CustomCoder(LM):
             times.append(t1 - t0)
         return sum(times) / len(times) if times else 0.0
 
-    @property
-    def batch_size(self):
-        return self.batch_size_per_gpu
-
-    @property
-    def device(self):
-        return self._device
-
-    @property
-    def rank(self):
-        return self.accelerator.process_index
-
-    @property
-    def world_size(self):
-        return self.accelerator.num_processes
-
-
-# Removed ensure_perplexity_in_results and measure_and_inject_inference_time
-# Metrics are now calculated directly during evaluation:
-# - Inference time: measured in generate_until() method
-# - Perplexity: calculated on prompts in generate_until() method (for generation tasks)
-
 
 if __name__ == "__main__":
     # This allows us to run the evaluation directly from the command line
@@ -579,51 +540,7 @@ if __name__ == "__main__":
             output_path = sys.argv[i + 1]
             break
     
-    # Check if any perplexity tasks are being evaluated and add default limit=100 if not specified
-    # Perplexity tasks use loglikelihood_rolling output type - check OUTPUT_TYPE, not keywords
-    has_limit = '--limit' in sys.argv
-    if not has_limit:
-        # Import tasks to check OUTPUT_TYPE
-        from lm_eval import tasks
-        
-        tasks_idx = None
-        for i, arg in enumerate(sys.argv):
-            if arg == "--tasks" and i + 1 < len(sys.argv):
-                tasks_idx = i + 1
-                break
-        
-        if tasks_idx is not None:
-            tasks_str = sys.argv[tasks_idx]
-            tasks_list = [t.strip() for t in tasks_str.split(',')]
-            
-            # Check if any task uses loglikelihood_rolling output type
-            has_perplexity_task = False
-            for task_name in tasks_list:
-                try:
-                    # Initialize tasks to check their OUTPUT_TYPE
-                    tasks.initialize_tasks()
-                    if task_name in tasks.TASK_REGISTRY:
-                        task = tasks.TASK_REGISTRY[task_name]()
-                        # Check if task uses loglikelihood_rolling (perplexity)
-                        if hasattr(task, 'OUTPUT_TYPE') and task.OUTPUT_TYPE == "loglikelihood_rolling":
-                            has_perplexity_task = True
-                            eval_logger.info(f"Perplexity task detected: '{task_name}' uses loglikelihood_rolling")
-                            break
-                except Exception as e:
-                    # If task can't be loaded, skip it
-                    eval_logger.debug(f"Could not check task '{task_name}': {e}")
-                    continue
-            
-            if has_perplexity_task:
-                # Insert --limit 100 before --tasks
-                sys.argv.insert(tasks_idx, '100')
-                sys.argv.insert(tasks_idx, '--limit')
-                eval_logger.info("Adding default --limit 100 for perplexity evaluation (faster)")
-    
     cli_evaluate()
-    
-    # Metrics (inference time and perplexity) are now calculated directly during evaluation
-    # No need to parse results files - they're printed during the evaluation process
     
     # Only upload to wandb if wandb_project_name was provided
     if wandb_project_name:

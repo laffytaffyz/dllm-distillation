@@ -64,7 +64,7 @@ def main():
         type=str,
         nargs="+",
         default=["humaneval_iris", "humaneval_plus_iris", "mbpp_iris", "mbpp_plus_iris"],
-        help="Tasks to evaluate (default: all generation tasks; perplexity is computed on prompts automatically)"
+        help="Tasks to evaluate (default: all generation tasks)"
     )
     parser.add_argument(
         "--cuda_devices",
@@ -106,13 +106,28 @@ def main():
         print(f"Error: Could not find eval script at {eval_script}")
         sys.exit(1)
     
+    # Determine if this is a .pt checkpoint file and set base_model if needed
+    base_model_arg = ""
+    base_model = None
+    if model_path.endswith('.pt'):
+        # This is a checkpoint file, need to specify base_model
+        # Default base model path
+        default_base_model = "/orcd/data/tpoggio/001/tiffany8/dllm-distillation/models/open-dcoder-0.5B"
+        if os.path.isdir(default_base_model):
+            base_model = default_base_model
+        else:
+            # Fallback to HuggingFace model ID
+            base_model = "fredzzp/open-dcoder-0.5B"
+        base_model_arg = f",base_model={base_model}"
+        print(f"Detected .pt checkpoint file, using base_model: {base_model}")
+    
     # Create results directory
     model_name = os.path.basename(model_path)
-    results_dir = os.path.join(eval_dir, "evals_results", f"distilled-{model_name}")
+    results_dir = os.path.join(eval_dir, "evals_results", f"baseline-{model_name}-{args.steps}")
     os.makedirs(results_dir, exist_ok=True)
     
     print("=" * 50)
-    print("Evaluating Distilled Model")
+    print("Evaluating Baseline Model")
     print("=" * 50)
     print(f"Model Path: {model_path}")
     print(f"Steps: {args.steps}")
@@ -120,6 +135,8 @@ def main():
     print(f"Temperature: {args.temperature}")
     print(f"Tasks: {', '.join(args.tasks)}")
     print(f"Results Dir: {results_dir}")
+    if base_model:
+        print(f"Base Model: {base_model}")
     print("=" * 50)
     print()
     
@@ -131,6 +148,7 @@ def main():
         f"add_bos_token=true,"
         f"temperature={args.temperature},"
         f"alg={args.alg}"
+        f"{base_model_arg}"
     )
     
     # Run evaluation for each task
@@ -179,4 +197,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
